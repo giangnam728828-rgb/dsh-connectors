@@ -15,6 +15,8 @@
  * The third point is the actual point: "connect once" is only real if the next
  * plugin you install can reuse the connection.
  */
+import { join } from 'node:path';
+
 import { createVault, connectorHome, project } from './src/vault.js';
 import { allProviders, publicProvider } from './src/providers.js';
 import {
@@ -29,6 +31,17 @@ import {
   statusReport,
 } from './src/actions.js';
 import { renderPage } from './src/page.js';
+import {
+  PANEL_ID,
+  STRIP_ID,
+  copyText,
+  panelData,
+  panelView,
+  stripData,
+  unavailablePanelData,
+  words as dshGoWords,
+} from './src/dshgo.js';
+import { watchFileChanges } from './src/vault-watch.js';
 
 export const name = 'dsh-connectors';
 
@@ -475,8 +488,14 @@ export function apply(ctx) {
   // returns the token. Reading the raw secret is a separate capability that the
   // user has to grant explicitly (`service:allowRawCredentials`), because one
   // plugin with a token is one plugin that can copy it anywhere.
+  //
+  // A reduced embedding context (the dsh-go checker's load host is one) has no
+  // `provide`; skipping publication there keeps the rest of the plugin loaded
+  // instead of failing the whole apply.
+  const publishConnectors =
+    typeof ctx.provide === 'function' ? (service) => ctx.provide('connectors', service) : () => () => {};
   ctx.effect(() =>
-    ctx.provide('connectors', {
+    publishConnectors({
       home,
       /** What this service currently permits. Probes without throwing. */
       async capabilities() {
@@ -651,6 +670,126 @@ export function apply(ctx) {
       const disposer = uiCtx.webServer.register({ kind: 'exact', path: PAGE_PATH, handler: pageHandler });
       return () => {
         if (typeof disposer === 'function') disposer();
+      };
+    });
+  });
+
+  // dsh-go native surface: the app declares the slots in package.json and the
+  // host half feeds them here. The app renders the panel itself, so there is no
+  // page, no WebView and no token in the view. This callback runs only where the
+  // dsh-go bridge is installed; every other carrier keeps the web settings page.
+  //
+  // `dshGo` is injected here, not in the module-level `inject`: a hard
+  // dependency would keep the whole plugin from loading on the web, ACP and
+  // headless shells, which do not have the bridge.
+  ctx.inject(['dshGo'], (goCtx) => {
+    /** @type {Set<() => void>} */
+    const listeners = new Set();
+    let stopWatching;
+
+    /** Fan one vault change out to the open panel and strip. */
+    const subscribe = (listener) => {
+      listeners.add(listener);
+      if (stopWatching === undefined) {
+        stopWatching = watchFileChanges(join(home, 'vault.json'), () => {
+          for (const notify of [...listeners]) {
+            try {
+              notify();
+            } catch {
+              // One feed must not silence the others.
+            }
+          }
+        });
+      }
+      return () => {
+        listeners.delete(listener);
+        if (listeners.size === 0 && stopWatching !== undefined) {
+          stopWatching();
+          stopWatching = undefined;
+        }
+      };
+    };
+
+    goCtx.effect(() => () => {
+      listeners.clear();
+      if (stopWatching !== undefined) {
+        stopWatching();
+        stopWatching = undefined;
+      }
+    });
+
+    // The panel and the strip both read the same report. A 500 ms cache keeps a
+    // connect (which touches the vault several times) from decrypting the whole
+    // vault once per feed.
+    let reportCache = null;
+    let reportAt = 0;
+    let reportInflight = null;
+
+    /** @returns the provider report, or null when the vault is unreadable. */
+    const readReport = () => {
+      const now = Date.now();
+      if (reportCache !== null && now - reportAt < 500) return Promise.resolve(reportCache);
+      if (reportInflight !== null) return reportInflight;
+      reportInflight = statusReport(home)
+        .then((report) => {
+          reportCache = report;
+          reportAt = Date.now();
+          return report;
+        })
+        .catch(() => null)
+        .finally(() => {
+          reportInflight = null;
+        });
+      return reportInflight;
+    };
+
+    /** @param locale - the app's locale tag. @returns the panel payload. */
+    const readPanel = async (locale) => {
+      const report = await readReport();
+      return report === null ? unavailablePanelData(locale) : panelData(report, locale);
+    };
+
+    goCtx.dshGo.panel(PANEL_ID, {
+      view: (scope, caps) => panelView(caps),
+      data: (scope, emit, caps) => {
+        let alive = true;
+        const push = () => {
+          if (!alive) return;
+          void readPanel(caps?.locale).then((data) => {
+            if (alive) emit(data);
+          });
+        };
+        push();
+        const unsubscribe = subscribe(push);
+        return () => {
+          alive = false;
+          unsubscribe();
+        };
+      },
+      actions: {
+        refresh: () => ({ refresh: true }),
+        copy: async (scope, event) => ({
+          copy: copyText(await readPanel(event?.locale), event?.locale),
+          toast: dshGoWords(event?.locale).copied,
+        }),
+      },
+    });
+
+    // Hidden until something is connected: the strip answers "is anything
+    // authorised?" in one glance and opens the panel on tap.
+    goCtx.dshGo.strip(STRIP_ID, (scope, emit, caps) => {
+      let alive = true;
+      const push = () => {
+        if (!alive) return;
+        void readPanel(caps?.locale).then((data) => {
+          if (alive) emit(stripData(data, caps?.locale));
+        });
+      };
+      push();
+      const unsubscribe = subscribe(push);
+      return () => {
+        alive = false;
+        unsubscribe();
       };
     });
   });

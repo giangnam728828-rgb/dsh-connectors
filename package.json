@@ -1,6 +1,6 @@
 {
   "name": "dsh-connectors",
-  "version": "0.2.1",
+  "version": "0.3.0",
   "description": "Connect every platform once: one encrypted vault for GitHub, GitLab, Gitee, Vercel, Cloudflare, npm and more, shared by every DSH tool and plugin.",
   "type": "module",
   "license": "MIT",
@@ -57,6 +57,39 @@
       "immediately": true,
       "inject": [
         "@deepseek-ai/dsh-client-ui-settings-general"
+      ]
+    }
+  },
+  "dshGo": {
+    "v": 1,
+    "title": {
+      "zh": "连接器",
+      "en": "Connectors"
+    },
+    "icon": "link",
+    "contributes": {
+      "composer.strip": [
+        {
+          "id": "connected",
+          "icon": "link",
+          "panel": "connectors"
+        }
+      ],
+      "panels": [
+        {
+          "id": "connectors",
+          "title": {
+            "zh": "连接器",
+            "en": "Connectors"
+          },
+          "icon": "link",
+          "placement": [
+            "session.tab",
+            "features",
+            "plugin"
+          ],
+          "presentation": "sheet"
+        }
       ]
     }
   },

@@ -116,6 +116,10 @@ test('without connection the HTTP surfaces stay absent, not broken', () => {
 
   plugin.apply(harness.ctx);
 
-  assert.deepEqual(harness.injected, [['connection'], ['connection', 'webServer']], 'the API and page declare their own carriers');
+  assert.deepEqual(
+    harness.injected,
+    [['connection'], ['connection', 'webServer'], ['dshGo']],
+    'the API, the page and the native panel each declare their own carrier',
+  );
   assert.equal(harness.registered.length, 2);
 });

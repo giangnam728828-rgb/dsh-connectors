@@ -12,6 +12,7 @@ This plugin collapses that into: **connect once, encrypt locally, let every call
 - Tokens never travel through chat: DSH records everything in its trajectory, so the only input paths are the settings page, the standalone page, or a terminal.
 - Tokens can only be spent at their own platform: the model names a provider and a path, the host is fixed by the preset.
 - Other plugins reuse the connection through a `connectors` Cordis service.
+- On DSH Go the phone shows a native "Connectors" panel and an "N connected" strip — authorised platforms only, no web page involved.
 
 ## Supported platforms
 
@@ -39,10 +40,13 @@ The npm distribution ships five profile templates (`acp` / `web` / `headless` / 
 | --- | --- | --- | --- | --- | --- | --- |
 | Browser | `web` | yes, measured | yes, measured | yes, measured | yes, measured | yes |
 | Desktop client (Electron) | separate | expected | expected | expected (carrier-neutral) | absent (no `webServer`) | yes (same client bundle) |
+| DSH Go (Android / iOS) | in-app engine | expected | expected | through the app's `/dsh-go/v1` bridge | not rendered (native UI) | not rendered (native panel instead) |
 | Editor ACP client | `acp` | yes, measured | yes, measured | — | — | — |
 | One-shot script | `headless` | yes, measured | yes, measured | — | — | — |
 | SDK embedding | `sdk` | config composes, not run | same | — | — | — |
 | Minimal SDK | `sdk-minimal` | n/a (no `tools`) | n/a | — | — | — |
+
+**DSH Go's UI is not a web page.** The app does not render `/dsh-connectors` and does not run plugin frontend code; it reads the `dshGo` manifest in `package.json`, and the host half feeds the slot through `ctx.dshGo`, so the app draws it with its own widgets. Since 0.3.0 the plugin declares one native "Connectors" panel and one status strip — see [DSH Go native panel](#dsh-go-native-panel). The rest of that row says "expected" because this round had no Android device; the protocol layer was checked with dsh-go's own `plugin-kit` checker and test host (`test/dshgo.test.mjs`).
 
 The desktop row says "expected", not "measured": this repository has no desktop binary to run in CI. The code no longer hard-depends on `webServer`, and `/api` routes go through the carrier-neutral fetch registry, so an IPC carrier should dispatch them too; confirming that needs one install of the desktop client and a `dsh plugin --profile <name> list` to learn its profile name. **The desktop client has no standalone page** — its entry point is the settings section.
 
@@ -52,7 +56,8 @@ The desktop row says "expected", not "measured": this repository has no desktop 
 
 1. **Settings → Connectors** for the desktop UI.
 2. **`http://<harness>/dsh-connectors`** for a narrow-screen page that works from a phone browser or a tunnel. It shares the app's session: an unauthenticated request gets **401**, so open the harness first.
-3. **Terminal**, when there is no comfortable browser:
+3. **DSH Go's native panel**, once the dsh-go bridge is installed: All features, the plugin detail page and a chat's Plugins tab show "Connectors" with the platforms that are already authorised. Authorising still happens in the settings page or the terminal.
+4. **Terminal**, when there is no comfortable browser:
 
 ```bash
 npx -y dsh-connectors add github          # hidden input
@@ -61,6 +66,25 @@ npx -y dsh-connectors list
 ```
 
 Each token is verified against the platform's identity endpoint before it is stored. Verify failures are reported immediately, and a network failure never silently discards the token.
+
+### DSH Go native panel
+
+DSH Go does not run plugin frontend code and never opens `/dsh-connectors`. At install time it reads the `dshGo` manifest from `package.json`; the host half pushes the panel through `ctx.dshGo.panel()`, and the app draws it with native widgets, sending taps back as JSON actions. The plugin declares two surfaces:
+
+| Surface | When it appears | What it shows |
+| --- | --- | --- |
+| `panels` → "Connectors" | All features, plugin detail, chat details › Plugins | Authorised platforms: name, account, last four characters of the token; the connected count on top |
+| `composer.strip` | Above the composer, **only when at least one platform is connected** | "3 connected"; tapping opens the same panel |
+
+Five boundaries, all deliberate:
+
+- **Read-only.** The panel makes no requests and changes no credential; *Refresh* re-reads the local vault, *Copy* puts the same list on the clipboard. Adding and removing credentials stays in the settings page, the standalone page or the terminal.
+- **No token in sight.** The data comes from the `project()` projection only: login, display name, `••••` plus the last four characters. The full secret never enters a view, a log or a conversation.
+- **Follows changes within 2 s.** While the panel is open it watches `vault.json`: `add` a platform in a terminal and the list updates without reopening the app.
+- **Disappears without the bridge.** The `ctx.inject(['dshGo'])` callback runs only where the dsh-go bridge is installed; the browser, desktop, ACP and headless carriers are unchanged.
+- **No app code.** The `dshGo` manifest only applies to the app; the web build keeps using the settings page.
+
+How it was checked: the manifest, the view and the host registrations were run through dsh-go's own `sdk/plugin-kit` checker and test host (`node sdk/plugin-kit/bin/check.mjs <plugin dir> --load` reports one displayable strip and one displayable panel, and all six placement × locale combinations pass). **A physical device has not been tested**: this round had no Android device, so rendering details and app-version differences remain to be confirmed on hardware; the protocol layer is aligned with v1.
 
 ### GitHub device flow
 
