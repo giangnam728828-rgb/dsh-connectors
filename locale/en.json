@@ -1,0 +1,6 @@
+{
+  "meta": {
+    "title": "Connectors",
+    "description": "Connect GitHub, GitLab, Gitee, Vercel, Cloudflare, npm and more once. Credentials stay encrypted on this machine and are reused by every session, tool and plugin."
+  }
+}

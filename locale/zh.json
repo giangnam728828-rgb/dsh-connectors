@@ -1,0 +1,6 @@
+{
+  "meta": {
+    "title": "连接器",
+    "description": "一次连接 GitHub、GitLab、Gitee、Vercel、Cloudflare、npm 等平台，凭据加密保存在本机，会话、工具和其他插件都能直接复用。"
+  }
+}

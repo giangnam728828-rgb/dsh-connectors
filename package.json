@@ -1,0 +1,71 @@
+{
+  "name": "dsh-connectors",
+  "version": "0.1.0",
+  "description": "Connect every platform once: one encrypted vault for GitHub, GitLab, Gitee, Vercel, Cloudflare, npm and more, shared by every DSH tool and plugin.",
+  "type": "module",
+  "license": "MIT",
+  "main": "index.js",
+  "bin": {
+    "dsh-connectors": "./bin/dsh-connectors.mjs"
+  },
+  "keywords": [
+    "dsh",
+    "dsh-bundle",
+    "dsh-plugin",
+    "deepseek-harness",
+    "connectors",
+    "credentials",
+    "oauth",
+    "github",
+    "gitlab",
+    "vault"
+  ],
+  "engines": {
+    "node": "^22.19 || >=24",
+    "dsh": ">=0.2.1-rc.3 <0.3.0"
+  },
+  "exports": {
+    ".": "./index.js",
+    "./client": "./client.js",
+    "./vault": "./src/vault.js",
+    "./providers": "./src/providers.js",
+    "./locale/*.json": "./locale/*.json"
+  },
+  "files": [
+    ".github",
+    "LICENSE",
+    "README.en.md",
+    "README.md",
+    "bin",
+    "client.js",
+    "cordis.patch.yml",
+    "docs",
+    "index.js",
+    "locale/*.json",
+    "src"
+  ],
+  "scripts": {
+    "check": "node --check index.js && node --check client.js && node --check bin/dsh-connectors.mjs",
+    "test": "node --test test/*.test.mjs"
+  },
+  "dsh": {
+    "bundle": {
+      "patch": "./cordis.patch.yml"
+    },
+    "client": {
+      "platform": "web",
+      "immediately": true,
+      "inject": [
+        "@deepseek-ai/dsh-client-ui-settings-general"
+      ]
+    }
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/giangnam728828-rgb/dsh-connectors.git"
+  },
+  "homepage": "https://github.com/giangnam728828-rgb/dsh-connectors#readme",
+  "bugs": {
+    "url": "https://github.com/giangnam728828-rgb/dsh-connectors/issues"
+  }
+}
