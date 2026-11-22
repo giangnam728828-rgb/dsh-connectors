@@ -31,20 +31,37 @@ import {
 import { renderPage } from './src/page.js';
 
 export const name = 'dsh-connectors';
-export const inject = ['webServer'];
+
+/*
+ * No hard dependency on `webServer`.
+ *
+ * The browser shell mounts one, but the desktop shell serves the same bundle
+ * from `file://` over IPC and never binds a port. Declaring `webServer` as a
+ * hard dependency would leave the plugin permanently pending there — no tools,
+ * no service, no settings page. Each surface is attached where its own service
+ * exists instead.
+ */
+export const inject = [];
 
 const MAX_BODY_BYTES = 8 * 1024;
 
-const PATHS = {
-  page: '/dsh-connectors',
-  status: '/dsh-connectors/status',
-  connect: '/dsh-connectors/connect',
-  disconnect: '/dsh-connectors/disconnect',
-  deviceStart: '/dsh-connectors/device/start',
-  devicePoll: '/dsh-connectors/device/poll',
-  deviceCancel: '/dsh-connectors/device/cancel',
-  settings: '/dsh-connectors/settings',
+/**
+ * Every management endpoint lives under the harness `/api` surface, so it
+ * inherits the Host/Origin fence, the `SameSite=Strict` session cookie and the
+ * owner-principal check. The page keeps its own path because a browser needs a
+ * document, not JSON.
+ */
+const API_PREFIX = '/api/connectors';
+const API_PATHS = {
+  status: `${API_PREFIX}/status`,
+  connect: `${API_PREFIX}/connect`,
+  disconnect: `${API_PREFIX}/disconnect`,
+  deviceStart: `${API_PREFIX}/device/start`,
+  devicePoll: `${API_PREFIX}/device/poll`,
+  deviceCancel: `${API_PREFIX}/device/cancel`,
+  settings: `${API_PREFIX}/settings`,
 };
+const PAGE_PATH = '/dsh-connectors';
 
 /** A failure the client is allowed to see, carried as a stable code. */
 class RequestError extends Error {
@@ -55,6 +72,7 @@ class RequestError extends Error {
   }
 }
 
+/** Write JSON over the Node response, for the page route. */
 function sendJson(response, status, payload) {
   const text = JSON.stringify(payload);
   response.writeHead(status, {
@@ -65,18 +83,51 @@ function sendJson(response, status, payload) {
   response.end(text);
 }
 
+/** One Fetch response for an `/api` route. */
+function jsonResponse(status, payload) {
+  return new Response(JSON.stringify(payload), {
+    status,
+    headers: {
+      'content-type': 'application/json; charset=utf-8',
+      'cache-control': 'no-store',
+      'x-content-type-options': 'nosniff',
+    },
+  });
+}
+
 /**
- * Read a bounded JSON body.
- * @param request - incoming request.
+ * Read a bounded JSON body from a Fetch request.
+ *
+ * The route is registered as `streaming`, so the harness hands over a live
+ * stream rather than buffering it first. Exceeding the cap cancels the reader
+ * mid-stream instead of growing a buffer: a caller cannot make this endpoint
+ * allocate more than `MAX_BODY_BYTES`.
+ *
+ * @param request - the Fetch request.
  * @returns the parsed object.
  */
 async function readJsonBody(request) {
+  const declared = Number(request.headers.get('content-length') ?? '');
+  if (Number.isFinite(declared) && declared > MAX_BODY_BYTES) {
+    throw new RequestError('body-too-large', 'Request body is too large.', 413);
+  }
+  if (request.body === null) return {};
+  const reader = request.body.getReader();
   const chunks = [];
   let total = 0;
-  for await (const chunk of request) {
-    total += chunk.length;
-    if (total > MAX_BODY_BYTES) throw new RequestError('body-too-large', 'Request body is too large.', 413);
-    chunks.push(chunk);
+  try {
+    for (;;) {
+      const { done, value } = await reader.read();
+      if (done === true) break;
+      total += value.byteLength;
+      if (total > MAX_BODY_BYTES) {
+        await reader.cancel().catch(() => {});
+        throw new RequestError('body-too-large', 'Request body is too large.', 413);
+      }
+      chunks.push(Buffer.from(value));
+    }
+  } finally {
+    reader.releaseLock?.();
   }
   if (total === 0) return {};
   try {
@@ -88,32 +139,30 @@ async function readJsonBody(request) {
 }
 
 /**
- * Build a POST-only, same-origin JSON endpoint.
- * @param webServer - the host web server service.
+ * Build one POST-only JSON route on the harness `/api` surface.
+ *
+ * Trust and identity are decided before this handler runs: the `/api` bridge
+ * applies the Host/Origin fence, verifies the signed session cookie and admits
+ * only an owner principal. This function therefore never inspects `Origin` —
+ * doing so was what broke every reverse-proxied phone in 0.1.0.
+ *
  * @param handler - body handler resolving the payload.
- * @returns the request handler.
+ * @returns the Fetch handler.
  */
-function makeEndpoint(webServer, handler) {
-  return async (request, response) => {
+function makeApiRoute(handler) {
+  return async (request) => {
     try {
       if (request.method !== 'POST') {
-        sendJson(response, 405, { ok: false, error: 'method-not-allowed' });
-        return;
-      }
-      const expected = typeof webServer.getOrigin === 'function' ? webServer.getOrigin() : undefined;
-      const origin = request.headers.origin;
-      if (typeof expected === 'string' && typeof origin === 'string' && origin !== expected) {
-        sendJson(response, 403, { ok: false, error: 'cross-origin' });
-        return;
+        return jsonResponse(405, { ok: false, error: 'method-not-allowed' });
       }
       const body = await readJsonBody(request);
-      sendJson(response, 200, { ok: true, ...(await handler(body)) });
+      const payload = await handler(body);
+      return jsonResponse(200, { ok: true, ...payload });
     } catch (error) {
       if (error instanceof RequestError) {
-        sendJson(response, error.status, { ok: false, error: error.code, message: error.message });
-        return;
+        return jsonResponse(error.status, { ok: false, error: error.code, message: error.message });
       }
-      sendJson(response, 500, { ok: false, error: 'internal', message: 'The request could not be completed.' });
+      return jsonResponse(500, { ok: false, error: 'internal', message: 'The request could not be completed.' });
     }
   };
 }
@@ -128,10 +177,15 @@ function makeEndpoint(webServer, handler) {
  * @param home - connector home directory.
  * @returns start, poll, cancel and dispose.
  */
-function createDeviceFlows(home) {
+export function createDeviceFlows(home, deps = {}) {
   /** @type {Map<string, {generation: number, status: string, userCode?: string, verificationUri?: string, expiresAt: number, intervalMs: number, deviceCode?: string, clientId?: string, error?: string, timer?: NodeJS.Timeout}>} */
   const flows = new Map();
   const generations = new Map();
+  /** Cancels in-flight polls when the plugin unloads. */
+  const inFlight = new AbortController();
+  const pollFn = deps.pollDeviceFlow ?? pollDeviceFlow;
+  const startFn = deps.startDeviceFlow ?? startDeviceFlow;
+  const connectFn = deps.connect ?? connect;
   let disposed = false;
 
   function generationOf(providerId) {
@@ -169,10 +223,12 @@ function createDeviceFlows(home) {
       flow.status = 'expired';
       return;
     }
+    const wait = Math.min(flow.intervalMs, remaining);
+    const scaled = typeof deps.intervalScale === 'number' ? Math.max(1, Math.round(wait * deps.intervalScale)) : wait;
     flow.timer = setTimeout(() => {
       flow.timer = undefined;
       void tick(providerId, flow, generation);
-    }, Math.min(flow.intervalMs, remaining));
+    }, scaled);
     flow.timer.unref?.();
   }
 
@@ -183,10 +239,10 @@ function createDeviceFlows(home) {
       return;
     }
     try {
-      const result = await pollDeviceFlow(flow.clientId, flow.deviceCode);
+      const result = await pollFn(flow.clientId, flow.deviceCode, fetch, inFlight.signal);
       if (generationOf(providerId) !== generation || flows.get(providerId) !== flow) return;
       if (result.status === 'authorized') {
-        const stored = await connect(home, { provider: providerId, token: result.token, kind: 'oauth' });
+        const stored = await connectFn(home, { provider: providerId, token: result.token, kind: 'oauth' });
         if (!stored.ok) {
           flow.status = 'error';
           flow.error = stored.error ?? 'verify-failed';
@@ -220,7 +276,7 @@ function createDeviceFlows(home) {
       const scope = typeof settings[`${providerId}:scope`] === 'string' ? settings[`${providerId}:scope`] : 'repo read:user';
       let details;
       try {
-        details = await startDeviceFlow(clientId, scope);
+        details = await startFn(clientId, scope, fetch, inFlight.signal);
       } catch (error) {
         const code = String(error?.message ?? 'device-start-failed');
         throw new RequestError(['device-flow-disabled', 'client-id-rejected'].includes(code) ? code : 'device-start-failed', 'The provider refused to start a device flow.', 502);
@@ -244,6 +300,7 @@ function createDeviceFlows(home) {
     },
     dispose() {
       disposed = true;
+      inFlight.abort();
       for (const [providerId] of flows) invalidate(providerId);
     },
   };
@@ -355,98 +412,44 @@ const REQUEST_TOOL = {
  * Register endpoints, the settings page, the tools and the service.
  * @param ctx - the host plugin context.
  */
+/** Settings key a user flips to let other plugins read raw secrets. */
+const RAW_CREDENTIALS_KEY = 'service:allowRawCredentials';
+
+/**
+ * Whether the user has granted raw-secret reads to other plugins.
+ * @param home - connector home directory.
+ * @returns true only for an explicit boolean true.
+ */
+async function rawCredentialsGranted(home) {
+  const settings = await createVault(home).readSettings();
+  return settings[RAW_CREDENTIALS_KEY] === true;
+}
+
+/**
+ * Refuse a raw read unless the user granted it.
+ * @param home - connector home directory.
+ */
+async function assertRawCredentials(home) {
+  if (await rawCredentialsGranted(home)) return;
+  const error = new Error(
+    'Raw credentials are not granted to plugins. Use request(), or have the user enable service:allowRawCredentials.',
+  );
+  error.code = 'raw-credentials-not-granted';
+  throw error;
+}
+
+/**
+ * Register the tools, the service, the management routes and the page.
+ *
+ * Each surface attaches only where its service exists: tools and the Cordis
+ * service need nothing, the JSON routes need `connection`, and the HTML page
+ * needs `connection` plus `webServer`. A shell missing one of them loses that
+ * surface, not the whole plugin.
+ *
+ * @param ctx - the host plugin context.
+ */
 export function apply(ctx) {
   const home = connectorHome();
-
-  ctx.effect(() => {
-    const flows = createDeviceFlows(home);
-    const endpoint = (path, handler) => ctx.webServer.register({ kind: 'exact', path, handler: makeEndpoint(ctx.webServer, handler) });
-
-    const pageHandler = async (request, response) => {
-      if (request.method !== 'GET' && request.method !== 'HEAD') {
-        response.writeHead(405, { allow: 'GET, HEAD' });
-        response.end();
-        return;
-      }
-      const custom = await loadCustomProviders(home);
-      const providers = allProviders(custom).map(publicProvider);
-      const settings = await createVault(home).readSettings();
-      const html = renderPage({
-        providers,
-        clientIds: Object.fromEntries(providers.filter((provider) => provider.deviceFlow).map((provider) => [provider.id, resolveClientId(settings, provider.id)])),
-      });
-      response.writeHead(200, {
-        'content-type': 'text/html; charset=utf-8',
-        'cache-control': 'no-store',
-        'x-content-type-options': 'nosniff',
-        'content-security-policy':
-          "default-src 'none'; style-src 'unsafe-inline'; script-src 'unsafe-inline'; connect-src 'self'; img-src https: data:; base-uri 'none'; form-action 'none'",
-      });
-      response.end(request.method === 'HEAD' ? undefined : html);
-    };
-
-    const disposers = [
-      ctx.webServer.register({ kind: 'exact', path: PATHS.page, handler: pageHandler }),
-      endpoint(PATHS.status, async () => {
-        const report = await statusReport(home);
-        return {
-          home: report.home,
-          connected: report.connected,
-          total: report.total,
-          providers: report.providers,
-        };
-      }),
-      endpoint(PATHS.connect, async (body) => {
-        const result = await connect(home, {
-          provider: body.provider,
-          token: body.token,
-          username: body.username,
-          note: body.note,
-          skipVerify: body.skipVerify === true,
-        });
-        if (!result.ok) {
-          const status = result.error === 'verify-failed' ? 422 : 400;
-          throw new RequestError(result.error, result.message ?? 'The credential could not be stored.', status);
-        }
-        const report = await statusReport(home);
-        return { provider: result.provider, home: report.home, connected: report.connected, total: report.total, providers: report.providers };
-      }),
-      endpoint(PATHS.disconnect, async (body) => {
-        const removed = await disconnect(home, String(body.provider ?? ''));
-        const report = await statusReport(home);
-        return { removed, home: report.home, providers: report.providers, connected: report.connected, total: report.total };
-      }),
-      endpoint(PATHS.deviceStart, async (body) => ({
-        flow: await flows.start(String(body.provider ?? 'github')),
-      })),
-      endpoint(PATHS.devicePoll, async (body) => ({ flow: flows.publicFlow(String(body.provider ?? 'github')) })),
-      endpoint(PATHS.deviceCancel, async (body) => {
-        flows.cancel(String(body.provider ?? 'github'));
-        return { flow: null };
-      }),
-      endpoint(PATHS.settings, async (body) => {
-        const providerId = String(body.provider ?? 'github');
-        const raw = typeof body.clientId === 'string' ? body.clientId.trim() : '';
-        if (raw !== '' && !/^[A-Za-z0-9._-]{6,64}$/.test(raw)) {
-          throw new RequestError('bad-client-id', 'A client id looks like "Iv1.0123456789abcdef".', 400);
-        }
-        const scope = typeof body.scope === 'string' ? body.scope.trim().slice(0, 200) : undefined;
-        await createVault(home).patchSettings({
-          [`${providerId}:clientId`]: raw === '' ? undefined : raw,
-          ...(scope === undefined ? {} : { [`${providerId}:scope`]: scope === '' ? undefined : scope }),
-        });
-        const report = await statusReport(home);
-        return { providers: report.providers };
-      }),
-    ];
-
-    return () => {
-      flows.dispose();
-      for (const dispose of disposers) {
-        if (typeof dispose === 'function') dispose();
-      }
-    };
-  });
 
   ctx.effect(() => {
     const tools = ctx.get('tools');
@@ -458,31 +461,22 @@ export function apply(ctx) {
   });
 
   // The seam other plugins use: ask the broker, not the human.
+  //
+  // Default posture is least privilege. A plugin may read connection state and
+  // spend a credential through `request()` — that path fixes the host and never
+  // returns the token. Reading the raw secret is a separate capability that the
+  // user has to grant explicitly (`service:allowRawCredentials`), because one
+  // plugin with a token is one plugin that can copy it anywhere.
   ctx.effect(() =>
     ctx.provide('connectors', {
       home,
+      /** What this service currently permits. Probes without throwing. */
+      async capabilities() {
+        return { version: 1, rawCredentials: await rawCredentialsGranted(home), request: true, status: true };
+      },
       /** @returns ids with a stored credential. */
       async list() {
         return createVault(home).ids();
-      },
-      /**
-       * The credential for one provider, for host-side code only.
-       * Never pass this value into a model prompt or a tool result.
-       * @param providerId - provider id.
-       * @returns the credential, or null.
-       */
-      async credential(providerId) {
-        const credential = await createVault(home).get(providerId);
-        return credential === null ? null : { ...credential };
-      },
-      /**
-       * The token alone, for code that already knows which provider it needs.
-       * @param providerId - provider id.
-       * @returns the token, or null.
-       */
-      async token(providerId) {
-        const credential = await createVault(home).get(providerId);
-        return typeof credential?.token === 'string' ? credential.token : null;
       },
       /**
        * Spend a credential on a request inside the provider origin.
@@ -498,6 +492,158 @@ export function apply(ctx) {
         return credential === null ? null : project(providerId, credential);
       },
       redact,
+      /**
+       * The credential for one provider, including the secret.
+       * Requires the raw-credential grant; never pass the value into a prompt
+       * or a tool result.
+       * @param providerId - provider id.
+       * @returns the credential, or null when absent.
+       */
+      async credential(providerId) {
+        await assertRawCredentials(home);
+        const credential = await createVault(home).get(providerId);
+        return credential === null ? null : { ...credential };
+      },
+      /**
+       * The token alone. Same grant as `credential()`.
+       * @param providerId - provider id.
+       * @returns the token, or null when absent.
+       */
+      async token(providerId) {
+        await assertRawCredentials(home);
+        const credential = await createVault(home).get(providerId);
+        return typeof credential?.token === 'string' ? credential.token : null;
+      },
     }),
   );
+
+  // Management routes: trust and identity are the harness's, not ours.
+  ctx.inject(['connection'], (apiCtx) => {
+    apiCtx.effect(() => {
+      const flows = createDeviceFlows(home);
+      /**
+       * @param path - absolute path below /api.
+       * @param handler - body handler.
+       */
+      const route = (path, handler) =>
+        apiCtx.connection.fetch.register({
+          path,
+          methods: ['POST'],
+          requestBody: 'streaming',
+          fetch: makeApiRoute(handler),
+        });
+
+      const disposers = [
+        route(API_PATHS.status, async () => {
+          const report = await statusReport(home);
+          return {
+            home: report.home,
+            connected: report.connected,
+            total: report.total,
+            providers: report.providers,
+            rejectedProviders: report.rejectedProviders,
+          };
+        }),
+        route(API_PATHS.connect, async (body) => {
+          const result = await connect(home, {
+            provider: body.provider,
+            token: body.token,
+            username: body.username,
+            note: body.note,
+            skipVerify: body.skipVerify === true,
+          });
+          if (!result.ok) {
+            const status = result.error === 'verify-failed' ? 422 : 400;
+            throw new RequestError(result.error, result.message ?? 'The credential could not be stored.', status);
+          }
+          const report = await statusReport(home);
+          return { provider: result.provider, home: report.home, connected: report.connected, total: report.total, providers: report.providers };
+        }),
+        route(API_PATHS.disconnect, async (body) => {
+          const removed = await disconnect(home, String(body.provider ?? ''));
+          const report = await statusReport(home);
+          return { removed, home: report.home, providers: report.providers, connected: report.connected, total: report.total };
+        }),
+        route(API_PATHS.deviceStart, async (body) => ({
+          flow: await flows.start(String(body.provider ?? 'github')),
+        })),
+        route(API_PATHS.devicePoll, async (body) => ({ flow: flows.publicFlow(String(body.provider ?? 'github')) })),
+        route(API_PATHS.deviceCancel, async (body) => {
+          flows.cancel(String(body.provider ?? 'github'));
+          return { flow: null };
+        }),
+        route(API_PATHS.settings, async (body) => {
+          const providerId = String(body.provider ?? 'github');
+          const raw = typeof body.clientId === 'string' ? body.clientId.trim() : '';
+          if (raw !== '' && !/^[A-Za-z0-9._-]{6,64}$/.test(raw)) {
+            throw new RequestError('bad-client-id', 'A client id looks like "Iv1.0123456789abcdef".', 400);
+          }
+          const scope = typeof body.scope === 'string' ? body.scope.trim().slice(0, 200) : undefined;
+          await createVault(home).patchSettings({
+            [`${providerId}:clientId`]: raw === '' ? undefined : raw,
+            ...(scope === undefined ? {} : { [`${providerId}:scope`]: scope === '' ? undefined : scope }),
+          });
+          const report = await statusReport(home);
+          return { providers: report.providers };
+        }),
+      ];
+
+      return () => {
+        flows.dispose();
+        for (const dispose of disposers) {
+          if (typeof dispose === 'function') dispose();
+        }
+      };
+    });
+  });
+
+  // The standalone page: one document, no secrets, same session as the app.
+  ctx.inject(['connection', 'webServer'], (uiCtx) => {
+    uiCtx.effect(() => {
+      const pageHandler = async (request, response) => {
+        if (request.method !== 'GET' && request.method !== 'HEAD') {
+          response.writeHead(405, { allow: 'GET, HEAD' });
+          response.end();
+          return;
+        }
+        // A document is as sensitive as the API behind it: it lists accounts
+        // and offers forms that spend credentials. The harness decides who may
+        // read it; a request that does not come from a signed-in owner gets the
+        // same answer the API would give.
+        const rejection = uiCtx.connection.requestRejection(request);
+        if (rejection !== undefined) {
+          const body = '<!doctype html><meta charset="utf-8"><title>Connectors</title><p>Open DeepSeek Harness and sign in first, then reload this page.';
+          response.writeHead(rejection, {
+            'content-type': 'text/html; charset=utf-8',
+            'cache-control': 'no-store',
+            'x-content-type-options': 'nosniff',
+          });
+          response.end(request.method === 'HEAD' ? undefined : body);
+          return;
+        }
+        const custom = await loadCustomProviders(home);
+        const providers = allProviders(custom).map(publicProvider);
+        const settings = await createVault(home).readSettings();
+        const html = renderPage({
+          providers,
+          clientIds: Object.fromEntries(
+            providers.filter((provider) => provider.deviceFlow).map((provider) => [provider.id, resolveClientId(settings, provider.id)]),
+          ),
+        });
+        response.writeHead(200, {
+          'content-type': 'text/html; charset=utf-8',
+          'cache-control': 'no-store',
+          'x-content-type-options': 'nosniff',
+          'content-security-policy':
+            "default-src 'none'; style-src 'unsafe-inline'; script-src 'unsafe-inline'; connect-src 'self'; img-src https: data:; base-uri 'none'; form-action 'none'",
+        });
+        response.end(request.method === 'HEAD' ? undefined : html);
+      };
+
+      const disposer = uiCtx.webServer.register({ kind: 'exact', path: PAGE_PATH, handler: pageHandler });
+      return () => {
+        if (typeof disposer === 'function') disposer();
+      };
+    });
+  });
 }

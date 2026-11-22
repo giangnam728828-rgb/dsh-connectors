@@ -51,7 +51,7 @@ dsh plugin --profile web add dsh-connectors
 三种入口，按你手边有什么选：
 
 1. **设置页**：`设置 → 连接器`，点"连接"，粘贴令牌。适合电脑端。
-2. **独立页面**：浏览器打开 `http://<你的 DSH 地址>/dsh-connectors`。这是为手机准备的，布局按窄屏做的，DSH Go 里也能直接访问。
+2. **独立页面**：浏览器打开 `http://<你的 DSH 地址>/dsh-connectors`。布局按窄屏做的，适合手机浏览器和隧道访问；它和主界面共用同一个登录态，**未登录会返回 401**，需要先打开 DSH 主界面完成登录。
 3. **终端**：手机或服务器上没有顺手的浏览器时用这个。
 
 ```bash
@@ -115,26 +115,39 @@ Agent：→ conn_list                 （发现 github 已连接）
 
 ## 给其他插件复用
 
-这是"连接一次"最关键的一层。任何 host 侧插件都可以直接拿凭据，不必再让用户配一遍：
+这是"连接一次"最关键的一层。其他插件不需要再问用户要一遍令牌：
 
 ```js
-// 在你的插件里
 export const inject = ['connectors'];
 
 export function apply(ctx) {
   ctx.effect(() => {
     const connectors = ctx.get('connectors');
     if (connectors === undefined) return () => {};
-    // 需要令牌时
-    const token = await connectors.token('github');
-    // 或者让 broker 代发请求（推荐，域名与请求头都被约束）
+    // 推荐：让 broker 代发请求，域名与请求头都被约束，令牌不出主机
     const result = await connectors.request({ provider: 'github', path: '/user' });
     return () => {};
   });
 }
 ```
 
-服务还提供 `list()`、`credential(id)`、`status(id)` 和 `redact(value, secrets)`。约定只有一条：**令牌值不许进 prompt、不许进工具返回值**。
+服务分三档权限：
+
+| 能力 | 方法 | 默认 |
+| --- | --- | --- |
+| 连接状态 | `list()`、`status(id)`、`capabilities()` | 可用，无秘密 |
+| 受限请求 | `request({ provider, method, path, query, body })` | 可用，令牌不返回 |
+| 原始凭据 | `credential(id)`、`token(id)` | **默认拒绝**，抛 `raw-credentials-not-granted` |
+
+需要原始令牌的插件（例如要自己实现 git 协议）必须由用户显式授权：
+
+```bash
+npx -y dsh-connectors allow-raw on    # 开启
+npx -y dsh-connectors service         # 查看当前状态
+npx -y dsh-connectors allow-raw off   # 用完关掉
+```
+
+调用方可以先问 `capabilities()` 再决定走哪条路，不会因为未授权而崩溃。约定只有一条：**令牌值不许进 prompt、不许进工具返回值**。
 
 ## git push 不再贴令牌
 
@@ -162,10 +175,14 @@ git push   # 不再询问用户名密码
 说清楚边界，比堆形容词有用：
 
 - **加密落盘**：每条凭据用 AES-256-GCM 单独加密，AAD 绑定平台 id，密文挪到别的平台名下也解不开。主密钥是独立文件，与保险库分开存放。
+- **并发写**：同一目录的写入按目录排队，并用 `vault.lock` 跨进程互斥；两个进程同时保存不会互相覆盖。
 - **权限**：目录 `0700`，密钥与保险库 `0600`，写入走临时文件 + rename，崩溃不会留下半截文件。
 - **位置**：`$DSH_HOME/state/connectors`（或 `$DSH_CONNECTORS_HOME`），不在工作区里，Agent 的沙箱读不到。
 - **出站约束**：域名来自平台预设，路径必须以 `/` 开头，`//host` 和绝对 URL 一律拒绝；`authorization`、`cookie`、`x-api-key` 等敏感头不允许调用方覆盖。
-- **输入面**：本机回环上的 POST 接口，校验同源 `Origin`，请求体上限 8 KB，页面带 CSP；令牌永远不会回传给浏览器。
+- **入口鉴权**：管理接口挂在 DSH 的 `/api/connectors/*` 上，复用宿主自己的身份校验——Host/Origin 围栏、`SameSite=Strict` 的签名会话 cookie、owner 主体检查。未登录请求返回 401，跨站请求返回 403。插件**不再自己比对 Origin**，所以经反向代理或隧道访问时不会误判；代理域名需要在 DSH 侧用 `--trusted-host` 声明，这是部署者的授权动作，插件不能绕过。
+- **请求面**：只接受 POST，请求体流式读取并在 8 KB 处截断，页面带 CSP；令牌永远不会回传给浏览器。
+- **插件间**：原始令牌默认不开放给其他插件，`request()` 只放行平台预设里的域名。
+- **加密的边界**：密钥与密文在同一台机器、同一个系统账户下。它能挡住备份同步、误 `cat`、别的用户，**挡不住以你的账户运行的恶意程序**。
 - **失败处理**：401/403 只在结果里提示"凭据失效，请重新连接"，不会自动删除一条可能只是权限不足的令牌。
 - **断开**：只删除本机凭据，不撤销平台授权。要彻底撤销请去平台设置页。
 
@@ -188,12 +205,14 @@ git push   # 不再询问用户名密码
 ]
 ```
 
-`auth.kind` 支持 `bearer`、`header`（配 `header` / `prefix`）、`basic`（配 `username`）。`baseUrl` 必须是 HTTPS。`verify` 省略则跳过校验。
+`auth.kind` 支持 `bearer`、`header`（配 `header` / `prefix`）、`basic`（配 `username`）。`baseUrl` 必须是 HTTPS、不能带账号密码或查询串。`verify` 省略则跳过校验。
+
+**内置平台 id 是保留字。** 自定义项不能用 `github`、`gitlab` 这些名字，大小写、全角、零宽空格等变体都不行；想接 GitHub Enterprise 之类，请用一个新 id（例如 `github-enterprise`）。被拒的条目不会静默生效，`status` 接口的 `rejectedProviders` 会给出原因码：`id-reserved`、`id-duplicate`、`base-url-insecure` 等。
 
 ## 移动端说明
 
-- **DSH Go / 手机本机跑**：设置页可能不可用，用 `http://127.0.0.1:3080/dsh-connectors` 或终端命令；设备码登录比粘贴更适合手机。
-- **手机连电脑**：走 DSH Mobile / ds-harness-remote 时，独立页面同样可用，凭据保存在电脑那台机器上。
+- **DSH Go / 手机本机跑**：DSH Go 是 Flutter 原生界面，**不会渲染本插件的网页设置页**；目前可用的是独立页面（在 App 的网页版里打开）和终端命令，设备码登录比粘贴更适合手机。原生面板与斜杠命令在后续版本提供。
+- **手机连电脑**：走 DSH Mobile / ds-harness-remote 时，经隧道的域名要在 DSH 侧用 `--trusted-host` 声明，否则宿主的 Host 围栏会返回 403；凭据始终保存在电脑那台机器上。
 - **两边都要用**：两个 harness 各自保存一份。想共用一个目录，把 `DSH_CONNECTORS_HOME` 指到同步盘（注意同步盘的权限与备份策略）。
 
 ## 已知限制

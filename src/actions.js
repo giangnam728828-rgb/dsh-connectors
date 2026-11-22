@@ -14,13 +14,49 @@ import {
   publicProvider,
   RESERVED_HEADERS,
   resolveRequestUrl,
+  sanitizeCustomProviders,
   verifyCredential,
 } from './providers.js';
 
 const REQUEST_TIMEOUT_MS = 60_000;
-const MAX_RESPONSE_CHARS = 200_000;
+/** Bytes read from a platform response before the read is cancelled. */
+const MAX_RESPONSE_BYTES = 256 * 1024;
 const MAX_PREVIEW_CHARS = 20_000;
 const MAX_BODY_BYTES = 512 * 1024;
+
+/**
+ * Read a response body up to a hard byte cap.
+ *
+ * `await response.text()` allocates whatever the server sends before any size
+ * check runs, so one hostile or misconfigured endpoint could hand the harness a
+ * multi-gigabyte string. This reads chunk by chunk and cancels the stream the
+ * moment the cap is crossed, so peak memory stays bounded by the cap.
+ *
+ * @param response - the Fetch response.
+ * @param maxBytes - cap in bytes.
+ * @returns the text read so far and whether the body was cut.
+ */
+async function readLimitedBody(response, maxBytes) {
+  if (response.body === null || response.body === undefined) return { text: '', truncated: false };
+  const reader = response.body.getReader();
+  const chunks = [];
+  let total = 0;
+  try {
+    for (;;) {
+      const { done, value } = await reader.read();
+      if (done === true) break;
+      total += value.byteLength;
+      if (total > maxBytes) {
+        await reader.cancel().catch(() => {});
+        return { text: Buffer.concat(chunks).toString('utf8'), truncated: true };
+      }
+      chunks.push(Buffer.from(value));
+    }
+  } finally {
+    reader.releaseLock?.();
+  }
+  return { text: Buffer.concat(chunks).toString('utf8'), truncated: false };
+}
 
 /** Token shapes worth hiding even when they are not the stored credential. */
 const TOKEN_PATTERNS = [
@@ -61,53 +97,42 @@ export function redact(value, secrets) {
 }
 
 /**
- * Read a user's own provider presets.
+ * Read and validate a user's own provider presets.
  *
  * This is the "and later, more platforms" seam: a JSON array in the connector
  * home, using the same fields as the builtin table, without shipping a new
- * plugin version.
+ * plugin version. Every row passes `sanitizeCustomProviders`, so a row cannot
+ * shadow a built-in id or carry a malformed endpoint.
  *
  * @param home - connector home directory.
- * @returns validated presets; malformed rows are dropped rather than crashing.
+ * @returns accepted presets plus the rows that were refused and why.
  */
-export async function loadCustomProviders(home) {
+export async function loadCustomProvidersDetailed(home) {
   const { readFile } = await import('node:fs/promises');
   const path = await import('node:path');
+  let text;
   try {
-    const parsed = JSON.parse(await readFile(path.join(home, 'providers.json'), 'utf8'));
-    if (!Array.isArray(parsed)) return [];
-    const valid = [];
-    for (const row of parsed) {
-      if (row === null || typeof row !== 'object') continue;
-      if (typeof row.id !== 'string' || typeof row.baseUrl !== 'string') continue;
-      let origin;
-      try {
-        origin = new URL(row.baseUrl);
-      } catch {
-        continue;
-      }
-      if (origin.protocol !== 'https:') continue;
-      valid.push({
-        id: row.id.toLowerCase(),
-        name: typeof row.name === 'string' && row.name !== '' ? row.name : row.id,
-        category: typeof row.category === 'string' && row.category !== '' ? row.category : '自定义',
-        baseUrl: row.baseUrl,
-        auth: row.auth !== null && typeof row.auth === 'object' ? row.auth : { kind: 'bearer' },
-        defaultHeaders: row.defaultHeaders !== null && typeof row.defaultHeaders === 'object' ? row.defaultHeaders : {},
-        verify: row.verify !== null && typeof row.verify === 'object' ? row.verify : null,
-        docs: typeof row.docs === 'string' ? row.docs : '',
-        prefix: typeof row.prefix === 'string' ? row.prefix : '',
-        scopes: typeof row.scopes === 'string' ? row.scopes : '',
-        deviceFlow: row.deviceFlow === true,
-        needsUsername: row.needsUsername === true,
-        gitHosts: Array.isArray(row.gitHosts) ? row.gitHosts.filter((host) => typeof host === 'string') : undefined,
-        custom: true,
-      });
-    }
-    return valid;
-  } catch {
-    return [];
+    text = await readFile(path.join(home, 'providers.json'), 'utf8');
+  } catch (error) {
+    if (error?.code === 'ENOENT') return { accepted: [], rejected: [] };
+    return { accepted: [], rejected: [{ id: null, reason: 'providers-unreadable' }] };
   }
+  let parsed;
+  try {
+    parsed = JSON.parse(text);
+  } catch {
+    return { accepted: [], rejected: [{ id: null, reason: 'providers-not-json' }] };
+  }
+  return sanitizeCustomProviders(parsed);
+}
+
+/**
+ * The accepted custom presets.
+ * @param home - connector home directory.
+ * @returns validated presets; refused rows are dropped.
+ */
+export async function loadCustomProviders(home) {
+  return (await loadCustomProvidersDetailed(home)).accepted;
 }
 
 /**
@@ -117,11 +142,11 @@ export async function loadCustomProviders(home) {
  */
 export async function statusReport(home) {
   const vault = createVault(home);
-  const custom = await loadCustomProviders(home);
+  const custom = await loadCustomProvidersDetailed(home);
   const settings = await vault.readSettings();
   const ids = new Set(await vault.ids());
   const rows = [];
-  for (const provider of allProviders(custom)) {
+  for (const provider of allProviders(custom.accepted)) {
     const stored = ids.has(provider.id) ? project(provider.id, await vault.get(provider.id)) : null;
     rows.push({
       ...publicProvider(provider),
@@ -142,6 +167,7 @@ export async function statusReport(home) {
     home,
     vaultFile: vault.vaultFile,
     providers: rows,
+    rejectedProviders: custom.rejected,
     connected: rows.filter((row) => row.connected).length,
     total: rows.length,
   };
@@ -199,7 +225,7 @@ export async function connect(home, input, fetchImpl = fetch) {
     } catch (error) {
       // A network failure is not proof the token is wrong; say so instead of
       // discarding a credential the user may have typed correctly.
-      return { ok: false, error: 'verify-unreachable', message: String(error?.message ?? error).slice(0, 200) };
+      return { ok: false, error: 'verify-unreachable', message: redact(String(error?.message ?? error), [token]).slice(0, 200) };
     }
   }
 
@@ -297,12 +323,11 @@ export async function authedRequest(home, input, signal = undefined, fetchImpl =
     const combined = typeof AbortSignal.any === 'function' ? AbortSignal.any(signals) : signals[0];
     response = await fetchImpl(url, { method, headers, body, signal: combined });
   } catch (error) {
-    return { ok: false, error: 'network', message: String(error?.message ?? error).slice(0, 200) };
+    return { ok: false, error: 'network', message: redact(String(error?.message ?? error), [credential.token]).slice(0, 200) };
   }
 
-  const text = await response.text();
   const secrets = [credential.token];
-  const truncated = text.length > MAX_RESPONSE_CHARS;
+  const { text, truncated } = await readLimitedBody(response, MAX_RESPONSE_BYTES);
   let data = null;
   if (!truncated) {
     try {
@@ -320,7 +345,7 @@ export async function authedRequest(home, input, signal = undefined, fetchImpl =
     status: response.status,
     provider: provider.id,
     data: shaped,
-    ...(truncated ? { note: `response exceeded ${MAX_RESPONSE_CHARS} characters` } : {}),
+    ...(truncated ? { note: `response exceeded ${MAX_RESPONSE_BYTES} bytes` } : {}),
     ...(response.status === 401 || response.status === 403 ? { hint: 'the platform rejected this credential; reconnect it in Settings → Connectors' } : {}),
   };
 }
@@ -335,6 +360,13 @@ export async function authedRequest(home, input, signal = undefined, fetchImpl =
  * public client id: no secret, no redirect URI, no callback server.
  * ------------------------------------------------------------------ */
 
+/** A timeout that also honours a caller's cancellation. */
+function combineSignals(signal, timeoutMs) {
+  const timeout = AbortSignal.timeout(timeoutMs);
+  if (signal === undefined || signal === null) return timeout;
+  return typeof AbortSignal.any === 'function' ? AbortSignal.any([timeout, signal]) : timeout;
+}
+
 const GITHUB_DEVICE_CODE_URL = 'https://github.com/login/device/code';
 const GITHUB_ACCESS_TOKEN_URL = 'https://github.com/login/oauth/access_token';
 
@@ -345,12 +377,12 @@ const GITHUB_ACCESS_TOKEN_URL = 'https://github.com/login/oauth/access_token';
  * @param fetchImpl - fetch implementation.
  * @returns the codes and polling cadence.
  */
-export async function startDeviceFlow(clientId, scope = 'repo read:user', fetchImpl = fetch) {
+export async function startDeviceFlow(clientId, scope = 'repo read:user', fetchImpl = fetch, signal = undefined) {
   const response = await fetchImpl(GITHUB_DEVICE_CODE_URL, {
     method: 'POST',
     headers: { accept: 'application/json', 'content-type': 'application/x-www-form-urlencoded' },
     body: new URLSearchParams({ client_id: clientId, scope }),
-    signal: AbortSignal.timeout(15_000),
+    signal: combineSignals(signal, 15_000),
   });
   const text = await response.text();
   let data = null;
@@ -380,7 +412,7 @@ export async function startDeviceFlow(clientId, scope = 'repo read:user', fetchI
  * @param fetchImpl - fetch implementation.
  * @returns one of pending / slow-down / expired / denied / authorized.
  */
-export async function pollDeviceFlow(clientId, deviceCode, fetchImpl = fetch) {
+export async function pollDeviceFlow(clientId, deviceCode, fetchImpl = fetch, signal = undefined) {
   const response = await fetchImpl(GITHUB_ACCESS_TOKEN_URL, {
     method: 'POST',
     headers: { accept: 'application/json', 'content-type': 'application/x-www-form-urlencoded' },
@@ -389,7 +421,7 @@ export async function pollDeviceFlow(clientId, deviceCode, fetchImpl = fetch) {
       device_code: deviceCode,
       grant_type: 'urn:ietf:params:oauth:grant-type:device_code',
     }),
-    signal: AbortSignal.timeout(15_000),
+    signal: combineSignals(signal, 15_000),
   });
   const text = await response.text();
   let data = null;

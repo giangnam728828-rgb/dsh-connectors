@@ -144,7 +144,7 @@ test('the page renders providers and no secret', () => {
     providers: [{ id: 'github', name: 'GitHub', category: '代码托管', docs: 'https://x', prefix: 'ghp_', scopes: 'repo', deviceFlow: true, needsUsername: false, verifiable: true }],
     clientIds: { github: '' },
   });
-  assert.match(html, /\/dsh-connectors\/connect/);
+  assert.match(html, /\/api\/connectors\/connect/);
   assert.match(html, /GitHub/);
   assert.equal(html.includes('ghp_abcdef'), false);
 });

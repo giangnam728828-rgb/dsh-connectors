@@ -18,13 +18,109 @@
  * this module's helpers.
  */
 import { createCipheriv, createDecipheriv, randomBytes } from 'node:crypto';
-import { chmod, mkdir, readFile, rename, stat, unlink, writeFile } from 'node:fs/promises';
+import { chmod, mkdir, open, readFile, rename, stat, unlink, writeFile } from 'node:fs/promises';
 import { homedir } from 'node:os';
 import path from 'node:path';
 
 const VAULT_VERSION = 1;
 const KEY_BYTES = 32;
 const IV_BYTES = 12;
+
+/** How long a lock file may sit before another writer may break it. */
+const LOCK_STALE_MS = 10_000;
+/** How long a writer waits for another process before giving up. */
+const LOCK_WAIT_MS = 5_000;
+const LOCK_POLL_MS = 40;
+
+/**
+ * One write chain per vault directory, shared by every `createVault(home)` in
+ * this process.
+ *
+ * The chain used to live inside the returned object, which meant each request
+ * that called `createVault(home)` got its own queue: two concurrent saves read
+ * the same envelope and the later rename erased the earlier record. Keying by
+ * directory makes the queue a property of the vault, not of whoever opened it.
+ *
+ * @type {Map<string, Promise<unknown>>}
+ */
+const writeQueues = new Map();
+
+/** @param ms - milliseconds to wait. */
+function delay(ms) {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+/**
+ * Run one mutation after every earlier mutation of the same directory.
+ * @param home - vault directory.
+ * @param operation - the mutation.
+ * @returns its result.
+ */
+function serialized(home, operation) {
+  const previous = writeQueues.get(home) ?? Promise.resolve();
+  const run = previous.then(operation, operation);
+  const tail = run.then(
+    () => undefined,
+    () => undefined,
+  );
+  writeQueues.set(home, tail);
+  void tail.then(() => {
+    if (writeQueues.get(home) === tail) writeQueues.delete(home);
+  });
+  return run;
+}
+
+/**
+ * Whether a lock file is old enough to be considered abandoned.
+ * @param file - lock path.
+ * @returns true when the owner is presumed gone.
+ */
+async function lockIsStale(file) {
+  try {
+    const info = await stat(file);
+    return Date.now() - info.mtimeMs > LOCK_STALE_MS;
+  } catch {
+    return false;
+  }
+}
+
+/**
+ * Hold an exclusive lock on one vault directory across processes.
+ *
+ * The in-process queue already orders writers inside one harness; this covers
+ * the second process (`dsh` CLI next to a running `dsh web`, or a desktop shell
+ * sharing the same home). A stale lock is broken after ten seconds so a crashed
+ * writer cannot wedge the vault forever.
+ *
+ * @param home - vault directory.
+ * @param operation - work to run while holding the lock.
+ * @returns the operation's result.
+ */
+async function withLock(home, operation) {
+  const lockFile = path.join(home, 'vault.lock');
+  await ensurePrivateDir(home);
+  const deadline = Date.now() + LOCK_WAIT_MS;
+  for (;;) {
+    try {
+      const handle = await open(lockFile, 'wx', 0o600);
+      try {
+        await handle.writeFile(`${process.pid} ${Date.now()}`);
+        return await operation();
+      } finally {
+        await handle.close().catch(() => {});
+        await unlink(lockFile).catch(() => {});
+      }
+    } catch (error) {
+      if (error?.code !== 'EEXIST') throw error;
+      if (await lockIsStale(lockFile)) {
+        await unlink(lockFile).catch(() => {});
+        continue;
+      }
+      if (Date.now() >= deadline) throw new Error('vault-busy');
+      await delay(LOCK_POLL_MS);
+    }
+  }
+}
 
 /**
  * Where this installation keeps connector data.
@@ -140,9 +236,6 @@ export function createVault(home = connectorHome()) {
   const vaultFile = path.join(home, 'vault.json');
   const settingsFile = path.join(home, 'settings.json');
 
-  /** @type {Promise<unknown>} tail of the write chain */
-  let writes = Promise.resolve();
-
   /**
    * Read the raw vault envelope.
    * @returns `{ version, records }`, or an empty vault when the file is absent.
@@ -170,20 +263,6 @@ export function createVault(home = connectorHome()) {
   }
 
   /**
-   * Serialize one async mutation so two concurrent saves cannot interleave.
-   * @param operation - the mutation.
-   * @returns its result.
-   */
-  function serialized(operation) {
-    const run = writes.then(operation, operation);
-    writes = run.then(
-      () => undefined,
-      () => undefined,
-    );
-    return run;
-  }
-
-  /**
    * Store or replace one provider credential.
    * @param providerId - vault key.
    * @param credential - at least `token`; `username` is kept for basic auth.
@@ -193,7 +272,7 @@ export function createVault(home = connectorHome()) {
     const id = String(providerId ?? '').trim();
     if (id === '') throw new Error('provider-required');
     if (typeof credential?.token !== 'string' || credential.token.trim() === '') throw new Error('token-required');
-    return serialized(async () => {
+    return serialized(home, () => withLock(home, async () => {
       const key = await readOrCreateKey(home);
       const envelope = await readEnvelope();
       const record = {
@@ -211,7 +290,7 @@ export function createVault(home = connectorHome()) {
       envelope.records[id] = encrypt(key, JSON.stringify(record), `connectors:v${VAULT_VERSION}:${id}`);
       await writeEnvelope(envelope);
       return project(id, record);
-    });
+    }));
   }
 
   /**
@@ -242,13 +321,13 @@ export function createVault(home = connectorHome()) {
   async function remove(providerId) {
     const id = String(providerId ?? '').trim();
     if (id === '') return false;
-    return serialized(async () => {
+    return serialized(home, () => withLock(home, async () => {
       const envelope = await readEnvelope();
       if (!(id in envelope.records)) return false;
       delete envelope.records[id];
       await writeEnvelope(envelope);
       return true;
-    });
+    }));
   }
 
   /**
@@ -279,7 +358,7 @@ export function createVault(home = connectorHome()) {
    * @returns the merged settings.
    */
   async function patchSettings(patch) {
-    return serialized(async () => {
+    return serialized(home, () => withLock(home, async () => {
       const current = await readSettings();
       for (const [key, value] of Object.entries(patch)) {
         if (value === undefined) delete current[key];
@@ -287,7 +366,7 @@ export function createVault(home = connectorHome()) {
       }
       await writePrivateFile(settingsFile, JSON.stringify(current, null, 2));
       return current;
-    });
+    }));
   }
 
   return { home, vaultFile, put, get, remove, ids, readSettings, patchSettings };

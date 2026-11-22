@@ -51,6 +51,8 @@ function usage() {
     '  git-credential <get|store|erase>',
     '                            给 git 用的凭据助手（见 README）',
     '  path                       显示凭据目录',
+    '  allow-raw [on|off]         允许/禁止其他插件读取原始令牌（默认禁止）',
+    '  service                    查看插件间服务权限的当前状态',
     '  help                       显示这段说明',
     '',
     '环境变量: DSH_CONNECTORS_HOME 指定凭据目录；DSH_HOME 指定 harness 主目录。',
@@ -255,6 +257,35 @@ async function main() {
     const lines = names.map((name) => `export ${name}='${credential.token}'`);
     if (credential.username) lines.push(`export ${id.toUpperCase()}_USERNAME='${credential.username}'`);
     process.stdout.write(`${lines.join('\n')}\n`);
+    return;
+  }
+
+  if (command === 'allow-raw') {
+    const value = positionals[0] ?? 'on';
+    if (value !== 'on' && value !== 'off') {
+      process.stderr.write('用法: dsh-connectors allow-raw [on|off]\n');
+      process.exitCode = 2;
+      return;
+    }
+    await createVault(home).patchSettings({ 'service:allowRawCredentials': value === 'on' ? true : undefined });
+    process.stdout.write(
+      value === 'on'
+        ? '已允许其他插件读取原始令牌。用完建议立即执行 allow-raw off。\n'
+        : '已禁止其他插件读取原始令牌。\n',
+    );
+    return;
+  }
+
+  if (command === 'service') {
+    const settings = await createVault(home).readSettings();
+    const granted = settings['service:allowRawCredentials'] === true;
+    process.stdout.write(
+      [
+        `原始令牌读取: ${granted ? '已允许（allow-raw on）' : '已禁止（默认）'}`,
+        '受限平台请求 request(): 始终可用',
+        '连接状态 list()/status(): 始终可用',
+      ].join('\n') + '\n',
+    );
     return;
   }
 

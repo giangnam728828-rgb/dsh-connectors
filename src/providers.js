@@ -321,14 +321,192 @@ export const PROVIDERS = [
   },
 ];
 
+/** The ids a custom preset may never take. Frozen: a caller cannot widen the lock. */
+export const BUILTIN_IDS = Object.freeze(PROVIDERS.map((provider) => provider.id));
+
+/** One custom id: a letter or digit, then letters, digits, dot, dash, underscore. */
+const PROVIDER_ID_PATTERN = /^[\p{L}\p{N}][\p{L}\p{N}._-]*$/u;
+const MAX_PROVIDER_ID_LENGTH = 32;
+const MAX_URL_LENGTH = 2_048;
+const MAX_LABEL_LENGTH = 120;
+const HEADER_NAME_PATTERN = /^[!#$%&'*+.^_`|~0-9A-Za-z-]+$/;
+const HOST_PATTERN = /^[A-Za-z0-9](?:[A-Za-z0-9.-]*[A-Za-z0-9])?$/;
+const AUTH_KINDS = new Set(['bearer', 'header', 'basic']);
+const VERIFY_METHODS = new Set(['GET', 'HEAD', 'POST']);
+
 /**
- * Index the presets by id.
- * @returns a map from provider id to preset.
+ * Fold an id to the form the vault and the lock table compare.
+ *
+ * NFKC folds full-width and compatibility characters, the control/zero-width
+ * strip removes the invisible spellings that would otherwise read as a new id,
+ * and lowercasing makes `GitHub` name the same platform as `github`.
+ *
+ * @param value - raw id from a file, a request or the model.
+ * @returns the comparable form; empty string when nothing is left.
  */
+export function normalizeProviderId(value) {
+  return String(value ?? '')
+    .normalize('NFKC')
+    .replace(/[\s\u200b-\u200f\u2028\u2029\ufeff]/gu, '')
+    .toLowerCase();
+}
+
+/** @returns a set of built-in ids for O(1) lock checks. */
+function builtinIdSet() {
+  return new Set(PROVIDERS.map((provider) => provider.id));
+}
+
+/** @returns a map from built-in provider id to preset. */
 function indexPresets() {
   const map = new Map();
   for (const provider of PROVIDERS) map.set(provider.id, provider);
   return map;
+}
+
+/** Short, log-safe echo of a rejected value. */
+function echoId(value) {
+  const text = typeof value === 'string' ? value : String(value ?? '');
+  return text.length > MAX_PROVIDER_ID_LENGTH ? `${text.slice(0, MAX_PROVIDER_ID_LENGTH)}…` : text;
+}
+
+/** Reject one row with a stable reason code. */
+function reject(row, reason) {
+  return { rejected: { id: echoId(row?.id), reason } };
+}
+
+/**
+ * Validate one custom header map.
+ * @param headers - raw map from the file.
+ * @returns the accepted map, or a rejection reason.
+ */
+function sanitizeHeaders(headers) {
+  if (headers === undefined || headers === null) return { value: undefined };
+  if (typeof headers !== 'object' || Array.isArray(headers)) return { reason: 'headers-invalid' };
+  const out = {};
+  for (const [name, value] of Object.entries(headers)) {
+    const lower = String(name).toLowerCase();
+    if (!HEADER_NAME_PATTERN.test(name)) return { reason: 'header-name-invalid' };
+    if (RESERVED_HEADERS.has(lower)) return { reason: 'header-reserved' };
+    if (typeof value !== 'string') return { reason: 'header-value-invalid' };
+    if (value.length > MAX_LABEL_LENGTH) return { reason: 'header-value-too-long' };
+    out[lower] = value;
+  }
+  return { value: out };
+}
+
+/**
+ * Validate one custom preset and return the normalized copy.
+ *
+ * The returned object contains only known fields: a custom preset cannot smuggle
+ * extra keys into a request, and cannot name a built-in id.
+ *
+ * @param row - one entry of providers.json.
+ * @param seen - ids already accepted in this batch.
+ * @returns `{ provider }` or `{ rejected }`.
+ */
+function sanitizeCustomProvider(row, seen) {
+  if (row === null || typeof row !== 'object' || Array.isArray(row)) return reject(row, 'row-invalid');
+
+  const id = normalizeProviderId(row.id);
+  if (id === '') return reject(row, 'id-required');
+  if (id.length > MAX_PROVIDER_ID_LENGTH) return reject(row, 'id-too-long');
+  if (!PROVIDER_ID_PATTERN.test(id)) return reject(row, 'id-invalid');
+  if (BUILTIN_IDS.includes(id)) return reject(row, 'id-reserved');
+  if (seen.has(id)) return reject(row, 'id-duplicate');
+
+  const baseRaw = typeof row.baseUrl === 'string' ? row.baseUrl.trim() : '';
+  if (baseRaw === '' || baseRaw.length > MAX_URL_LENGTH) return reject(row, 'base-url-invalid');
+  let base;
+  try {
+    base = new URL(baseRaw);
+  } catch {
+    return reject(row, 'base-url-invalid');
+  }
+  if (base.protocol !== 'https:') return reject(row, 'base-url-insecure');
+  if (base.username !== '' || base.password !== '') return reject(row, 'base-url-has-userinfo');
+  if (base.search !== '' || base.hash !== '') return reject(row, 'base-url-has-query');
+  if (base.hostname === '') return reject(row, 'base-url-invalid');
+
+  const auth = row.auth !== null && typeof row.auth === 'object' && !Array.isArray(row.auth) ? row.auth : { kind: 'bearer' };
+  const kind = typeof auth.kind === 'string' ? auth.kind : 'bearer';
+  if (!AUTH_KINDS.has(kind)) return reject(row, 'auth-kind-invalid');
+  if (kind === 'header') {
+    const header = String(auth.header ?? '').toLowerCase();
+    if (!HEADER_NAME_PATTERN.test(header) || RESERVED_HEADERS.has(header)) return reject(row, 'auth-header-invalid');
+  }
+  const headers = sanitizeHeaders(row.defaultHeaders);
+  if (headers.reason !== undefined) return reject(row, headers.reason);
+
+  let verify = NO_VERIFY;
+  if (row.verify !== null && row.verify !== undefined) {
+    if (typeof row.verify !== 'object' || Array.isArray(row.verify)) return reject(row, 'verify-invalid');
+    const path = typeof row.verify.path === 'string' ? row.verify.path : '';
+    if (!path.startsWith('/') || path.startsWith('//')) return reject(row, 'verify-path-invalid');
+    const method = typeof row.verify.method === 'string' ? row.verify.method.toUpperCase() : 'GET';
+    if (!VERIFY_METHODS.has(method)) return reject(row, 'verify-method-invalid');
+    verify = {
+      path,
+      method,
+      ...(typeof row.verify.errorOf === 'function' ? { errorOf: row.verify.errorOf } : {}),
+      ...(typeof row.verify.pick === 'function' ? { pick: row.verify.pick } : {}),
+    };
+  }
+
+  const gitHosts = Array.isArray(row.gitHosts)
+    ? row.gitHosts.filter((host) => typeof host === 'string' && HOST_PATTERN.test(host)).map((host) => host.toLowerCase())
+    : undefined;
+
+  return {
+    provider: {
+      id,
+      name: typeof row.name === 'string' && row.name.trim() !== '' ? row.name.trim().slice(0, MAX_LABEL_LENGTH) : id,
+      category: typeof row.category === 'string' && row.category.trim() !== '' ? row.category.trim().slice(0, MAX_LABEL_LENGTH) : '自定义',
+      baseUrl: base.toString().replace(/\/+$/, ''),
+      auth: {
+        kind,
+        ...(kind === 'header' ? { header: String(auth.header).toLowerCase() } : {}),
+        ...(typeof auth.prefix === 'string' ? { prefix: auth.prefix.slice(0, 32) } : {}),
+        ...(typeof auth.username === 'string' ? { username: auth.username.slice(0, MAX_LABEL_LENGTH) } : {}),
+      },
+      ...(headers.value === undefined ? {} : { defaultHeaders: headers.value }),
+      verify,
+      docs: typeof row.docs === 'string' ? row.docs.slice(0, MAX_URL_LENGTH) : '',
+      prefix: typeof row.prefix === 'string' ? row.prefix.slice(0, 64) : '',
+      scopes: typeof row.scopes === 'string' ? row.scopes.slice(0, 300) : '',
+      deviceFlow: row.deviceFlow === true,
+      needsUsername: row.needsUsername === true,
+      ...(gitHosts === undefined ? {} : { gitHosts }),
+      custom: true,
+    },
+  };
+}
+
+/**
+ * Validate a whole custom preset list.
+ *
+ * This is the single gate every custom preset passes through, whichever caller
+ * loaded it. Rows that would shadow a built-in id, repeat an id, or carry a
+ * malformed endpoint are dropped with a reason instead of being merged.
+ *
+ * @param rows - parsed providers.json, or any caller-supplied array.
+ * @returns accepted presets plus the rejections, in input order.
+ */
+export function sanitizeCustomProviders(rows) {
+  if (rows === undefined || rows === null) return { accepted: [], rejected: [] };
+  if (!Array.isArray(rows)) return { accepted: [], rejected: [{ id: null, reason: 'not-an-array' }] };
+  const accepted = [];
+  const rejected = [];
+  const seen = new Set();
+  for (const row of rows) {
+    const outcome = sanitizeCustomProvider(row, seen);
+    if (outcome.provider !== undefined) {
+      accepted.push(outcome.provider);
+      seen.add(outcome.provider.id);
+    } else {
+      rejected.push(outcome.rejected);
+    }
+  }
+  return { accepted, rejected };
 }
 
 /**
@@ -351,26 +529,31 @@ export function publicProvider(provider) {
 }
 
 /**
- * Resolve a provider by id, letting a caller's custom presets override builtins.
- * @param id - provider id.
- * @param custom - extra presets from the user's own providers file.
+ * Resolve a provider by id. A built-in id always resolves to the built-in
+ * preset: a custom entry can add a platform, never redefine one.
+ * @param id - provider id, in any casing or width.
+ * @param custom - extra presets, sanitized here in case the caller bypassed the loader.
  * @returns the preset, or undefined for an unknown id.
  */
 export function providerById(id, custom = []) {
-  const key = String(id ?? '').trim().toLowerCase();
+  const key = normalizeProviderId(id);
   if (key === '') return undefined;
-  const customMap = new Map(custom.map((provider) => [provider.id, provider]));
-  return customMap.get(key) ?? indexPresets().get(key);
+  const builtin = indexPresets().get(key);
+  if (builtin !== undefined) return builtin;
+  return sanitizeCustomProviders(custom).accepted.find((provider) => provider.id === key);
 }
 
 /**
  * Every provider a user can connect, builtins first then custom ones.
  * @param custom - extra presets from the user's own providers file.
- * @returns the merged list, de-duplicated by id.
+ * @returns the merged list; a custom row can never take a built-in id.
  */
 export function allProviders(custom = []) {
   const map = indexPresets();
-  for (const provider of custom) map.set(provider.id, provider);
+  for (const provider of sanitizeCustomProviders(custom).accepted) {
+    if (map.has(provider.id)) continue;
+    map.set(provider.id, provider);
+  }
   return [...map.values()];
 }
 

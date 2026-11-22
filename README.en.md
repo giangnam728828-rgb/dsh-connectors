@@ -34,7 +34,7 @@ Compatibility: DSH 0.2.1-rc.3 – 0.2.x, Node `^22.19 || >=24`. Verified against
 ## Connect
 
 1. **Settings → Connectors** for the desktop UI.
-2. **`http://<harness>/dsh-connectors`** for a mobile-friendly page that also works from DSH Go and remote hosts.
+2. **`http://<harness>/dsh-connectors`** for a narrow-screen page that works from a phone browser or a tunnel. It shares the app's session: an unauthenticated request gets **401**, so open the harness first.
 3. **Terminal**, when there is no comfortable browser:
 
 ```bash
@@ -73,10 +73,19 @@ export function apply(ctx) {
   const connectors = ctx.get('connectors');
   // Recommended: the broker enforces origin and headers.
   const result = await connectors.request({ provider: 'github', path: '/user' });
-  // Or, for host-side code that needs the value itself:
-  const token = await connectors.token('github');
 }
 ```
+
+The service has three tiers:
+
+| Capability | Methods | Default |
+| --- | --- | --- |
+| Connection state | `list()`, `status(id)`, `capabilities()` | allowed, no secret |
+| Constrained request | `request({ provider, method, path, query, body })` | allowed, token never returned |
+| Raw credential | `credential(id)`, `token(id)` | **refused** with `raw-credentials-not-granted` |
+
+A plugin that genuinely needs the secret must be granted it by the user:
+`npx -y dsh-connectors allow-raw on`, then `allow-raw off` when done.
 
 One rule: a token value must never enter a prompt or a tool result.
 
@@ -95,7 +104,10 @@ Supports `github.com`, `gitlab.com` and `gitee.com`.
 - Vault directory `0700`, files `0600`, atomic writes.
 - Stored outside the workspace: `$DSH_HOME/state/connectors` or `$DSH_CONNECTORS_HOME`.
 - Outbound requests are pinned to the preset origin; `//host`, absolute URLs and reserved credential headers are rejected.
-- Loopback POST endpoints only, same-origin checked, 8 KB body cap, CSP on the page; the token is never returned to the browser.
+- Management routes live under the harness `/api/connectors/*` surface and inherit its Host/Origin fence, `SameSite=Strict` signed session cookie and owner-principal check. Unauthenticated requests get 401, cross-site requests get 403. The plugin no longer compares `Origin` itself, so reverse-proxied access is not misjudged; a proxy authority must be declared with `--trusted-host` on the harness side.
+- POST only, streamed 8 KB request-body cap, CSP on the page; the token is never returned to the browser.
+- Other plugins never receive the raw token by default.
+- Encryption covers backups, stray `cat` and other OS users. It does **not** stop a hostile program running as your account: the key and the ciphertext share one machine and one user.
 - Disconnecting deletes the local credential only; revoke the authorization on the platform if you want it gone everywhere.
 
 ## Limitations

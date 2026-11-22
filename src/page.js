@@ -312,7 +312,7 @@ footer code { font-size: 11px; background: var(--accent-soft); padding: 1px 5px;
     var button = $('sheetSubmit');
     button.disabled = true;
     button.textContent = '校验中…';
-    post('/dsh-connectors/connect', payload).then(function (result) {
+    post('/api/connectors/connect', payload).then(function (result) {
       button.disabled = false;
       button.textContent = '保存';
       if (!result.ok) {
@@ -331,7 +331,7 @@ footer code { font-size: 11px; background: var(--accent-soft); padding: 1px 5px;
       button.style.marginTop = '10px';
       button.textContent = '仍然保存（稍后自行验证）';
       button.onclick = function () {
-        post('/dsh-connectors/connect', Object.assign({}, base, { skipVerify: true })).then(function (result) {
+        post('/api/connectors/connect', Object.assign({}, base, { skipVerify: true })).then(function (result) {
           if (result.ok) { toast('已保存，但平台未确认这个令牌'); closeSheet(); refresh(); }
           else showError(describeError(result));
         });
@@ -347,7 +347,7 @@ footer code { font-size: 11px; background: var(--accent-soft); padding: 1px 5px;
     state.active = id;
     openSheet('用 GitHub 登录', '在手机浏览器里打开下面的地址，输入代码即可。这个页面会自动完成连接。', '<div class="device"><div class="hint">待批准</div><div class="code" id="userCode">…</div></div>');
     $('sheetSubmit').hidden = true;
-    post('/dsh-connectors/device/start', { provider: id }).then(function (result) {
+    post('/api/connectors/device/start', { provider: id }).then(function (result) {
       if (!result.ok || !result.flow) { showError(describeError(result)); return; }
       state.flow = result.flow;
       renderFlow(result.flow);
@@ -372,7 +372,7 @@ footer code { font-size: 11px; background: var(--accent-soft); padding: 1px 5px;
 
   function pollFlow() {
     if (!state.active) return;
-    post('/dsh-connectors/device/poll', { provider: state.active }).then(function (result) {
+    post('/api/connectors/device/poll', { provider: state.active }).then(function (result) {
       if (!result.ok) return;
       if (!result.flow) {
         if (state.timer) { clearInterval(state.timer); state.timer = null; }
@@ -391,7 +391,7 @@ footer code { font-size: 11px; background: var(--accent-soft); padding: 1px 5px;
     openSheet('OAuth App Client ID', '设备码登录只需要一个公开的 Client ID，不需要 Client Secret。', '<label for="clientId">Client ID</label><input id="clientId" autocapitalize="off" spellcheck="false" placeholder="Iv1.0123456789abcdef">');
     $('sheetSubmit').onclick = function () {
       var value = ($('clientId').value || '').trim();
-      post('/dsh-connectors/settings', { provider: id, clientId: value }).then(function (result) {
+      post('/api/connectors/settings', { provider: id, clientId: value }).then(function (result) {
         if (!result.ok) { showError(describeError(result)); return; }
         state.clientIds[id] = value;
         toast('已保存 Client ID');
@@ -405,7 +405,7 @@ footer code { font-size: 11px; background: var(--accent-soft); padding: 1px 5px;
     var row = providerOf(id);
     if (!row) return;
     if (!window.confirm('断开 ' + row.name + '？本机凭据会被删除，平台上的授权仍然保留。')) return;
-    post('/dsh-connectors/disconnect', { provider: id }).then(function (result) {
+    post('/api/connectors/disconnect', { provider: id }).then(function (result) {
       if (!result.ok) { toast(describeError(result)); return; }
       toast('已断开 ' + row.name);
       refresh();
@@ -437,7 +437,7 @@ footer code { font-size: 11px; background: var(--accent-soft); padding: 1px 5px;
   }
 
   function refresh() {
-    return post('/dsh-connectors/status', {}).then(function (result) {
+    return post('/api/connectors/status', {}).then(function (result) {
       if (result.ok) state.status = result;
       render();
     });

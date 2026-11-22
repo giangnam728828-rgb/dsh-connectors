@@ -181,7 +181,7 @@ window.__ModuleLoader__.load({
         }, []);
 
         const refresh = useCallback(async () => {
-          applyReport(await post('/dsh-connectors/status'));
+          applyReport(await post('/api/connectors/status'));
         }, [applyReport]);
 
         useEffect(() => {
@@ -193,7 +193,7 @@ window.__ModuleLoader__.load({
           if (flow === null || flow.status !== 'pending') return undefined;
           const provider = editing;
           const timer = setInterval(async () => {
-            const result = await post('/dsh-connectors/device/poll', { provider });
+            const result = await post('/api/connectors/device/poll', { provider });
             if (!alive.current) return;
             if (result.ok && result.flow === null) {
               setFlow(null);
@@ -236,7 +236,7 @@ window.__ModuleLoader__.load({
           }
           setBusy(true);
           setError(null);
-          const result = await post('/dsh-connectors/connect', {
+          const result = await post('/api/connectors/connect', {
             provider: editing,
             token: token.trim(),
             ...(username.trim() === '' ? {} : { username: username.trim() }),
@@ -254,7 +254,7 @@ window.__ModuleLoader__.load({
 
         const beginDevice = async () => {
           setError(null);
-          const result = await post('/dsh-connectors/device/start', { provider: editing });
+          const result = await post('/api/connectors/device/start', { provider: editing });
           if (!result.ok) {
             setError(result.error === 'client-id-missing' ? t('deviceNeedsClientId') : describe(result));
             return;
@@ -267,7 +267,7 @@ window.__ModuleLoader__.load({
             ? window.confirm(interpolate(t('disconnectConfirm'), { name: provider.name }))
             : true;
           if (!confirmed) return;
-          const result = await post('/dsh-connectors/disconnect', { provider: provider.id });
+          const result = await post('/api/connectors/disconnect', { provider: provider.id });
           if (result.ok) applyReport(result);
         };
 
