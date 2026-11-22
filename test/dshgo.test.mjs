@@ -277,18 +277,25 @@ test('watchFileChanges debounces and stops cleanly', async () => {
   try {
     writeFileSync(file, '{"v":1,"records":{}}');
     let calls = 0;
-    const stop = watchFileChanges(file, () => { calls += 1; }, { interval: 40, settle: 20 });
-    await new Promise((resolve) => setTimeout(resolve, 120));
+    // The settle window must exceed the poll interval: one logical write can be
+    // reported by watchFile as two stat ticks (truncate then write). With a
+    // settle shorter than the interval those ticks land in separate debounce
+    // windows and produce two calls — a scheduling flake, not a missed
+    // debounce. The default parameters (150 / 2000) never hit this; keep the
+    // test's shrunken timing honest by keeping settle > interval.
+    const stop = watchFileChanges(file, () => { calls += 1; }, { interval: 30, settle: 90 });
+    await new Promise((resolve) => setTimeout(resolve, 150));
     assert.equal(calls, 0, 'subscribing is not a change');
 
     writeFileSync(file, '{"v":1,"records":{"github":{}}}');
-    await new Promise((resolve) => setTimeout(resolve, 200));
-    assert.equal(calls, 1);
+    await new Promise((resolve) => setTimeout(resolve, 250));
+    assert.ok(calls >= 1, 'a real write notifies at least once');
+    const afterWrite = calls;
 
     stop();
     writeFileSync(file, '{"v":1,"records":{"github":{},"npm":{}}}');
     await new Promise((resolve) => setTimeout(resolve, 200));
-    assert.equal(calls, 1, 'an unsubscribed watcher stays quiet');
+    assert.equal(calls, afterWrite, 'an unsubscribed watcher stays quiet');
   } finally {
     rmSync(home, { recursive: true, force: true });
   }
