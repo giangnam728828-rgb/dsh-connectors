@@ -42,6 +42,7 @@ import {
   words as dshGoWords,
 } from './src/dshgo.js';
 import { watchFileChanges } from './src/vault-watch.js';
+import { COMMAND_NAME, makeConnectorsHandler } from './src/commands.js';
 
 export const name = 'dsh-connectors';
 
@@ -323,7 +324,7 @@ export function createDeviceFlows(home, deps = {}) {
 const LIST_TOOL = {
   name: 'conn_list',
   description:
-    'List the platforms connected to this harness and what each connection is for. Call this before asking the user for a token: if a connection exists, use conn_request instead. Tokens are never shown; each row only reports the account and a masked hint.',
+    'List the platforms connected to this harness and what each connection is for. Call this before asking the user for a token: if a connection exists, use conn_request instead. Tokens are never shown; each row only reports the account and a masked hint. If a platform is not connected, tell the user to run /connectors or connect it in Settings → Connectors.',
   parameters: { type: 'object', properties: {}, additionalProperties: false },
   output: {
     schema: { type: 'object', additionalProperties: true },
@@ -362,7 +363,7 @@ const LIST_TOOL = {
         needsUsername: row.needsUsername,
       })),
       connectHint:
-        'A human connects a platform in Settings → Connectors, or with the dsh-connectors CLI. Never ask for a token in chat: it would be written to the session trajectory.',
+        'A human connects a platform in Settings → Connectors, with the /connectors command, or with the CLI: npx -y dsh-connectors add <platform-id>. Run /connectors help for the full guide. Never ask for a token in chat: it would be written to the session trajectory.',
     };
   },
 };
@@ -543,6 +544,25 @@ export function apply(ctx) {
       },
     }),
   );
+
+  // Cross-carrier human command. `commands` is mounted by dsh-base, the common
+  // baseline of every profile, so /connectors is visible on every client that
+  // has a command palette — including shells with no settings-page service and
+  // no webServer. Injected (not declared) so a minimal host without commands
+  // still loads the rest of the plugin. Read-only: it reports state and tells
+  // the human where to connect, never returning a token.
+  ctx.inject(['commands'], (cmdCtx) => {
+    cmdCtx.effect(() =>
+      cmdCtx.commands.register({
+        definitionId: `dsh-connectors/${COMMAND_NAME}`,
+        name: COMMAND_NAME,
+        description: 'Show connection status and how to connect a platform (connectors)',
+        input: { hint: '[help|<platform-id>]' },
+        recordInput: false,
+        handler: makeConnectorsHandler(home),
+      }),
+    );
+  });
 
   // Management routes: trust and identity are the harness's, not ours.
   ctx.inject(['connection'], (apiCtx) => {

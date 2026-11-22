@@ -118,8 +118,8 @@ test('without connection the HTTP surfaces stay absent, not broken', () => {
 
   assert.deepEqual(
     harness.injected,
-    [['connection'], ['connection', 'webServer'], ['dshGo']],
-    'the API, the page and the native panel each declare their own carrier',
+    [['commands'], ['connection'], ['connection', 'webServer'], ['dshGo']],
+    'the command, API, page and native panel each declare their own carrier',
   );
   assert.equal(harness.registered.length, 2);
 });

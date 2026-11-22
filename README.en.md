@@ -36,15 +36,17 @@ Compatibility: DSH 0.2.1-rc.3 – 0.2.x, Node `^22.19 || >=24`. Verified against
 
 The npm distribution ships five profile templates (`acp` / `web` / `headless` / `sdk` / `sdk-minimal`). **The desktop client is not one of them**: it is a separately distributed Electron app with its own stable/nightly channel, and it serves the frontend over `file://` plus IPC without starting `webServer` — the type comment in `@deepseek-ai/dsh-host-webserver` says exactly that: *"Electron uses file:// plus IPC"*. The plugin attaches each surface only where its service exists.
 
-| Carrier | Profile | `conn_list` / `conn_request` | `connectors` service | `/api/connectors/*` | `/dsh-connectors` page | Settings section |
-| --- | --- | --- | --- | --- | --- | --- |
-| Browser | `web` | yes, measured | yes, measured | yes, measured | yes, measured | yes |
-| Desktop client (Electron) | separate | expected | expected | expected (carrier-neutral) | absent (no `webServer`) | yes (same client bundle) |
-| DSH Go (Android / iOS) | in-app engine | expected | expected | through the app's `/dsh-go/v1` bridge | not rendered (native UI) | not rendered (native panel instead) |
-| Editor ACP client | `acp` | yes, measured | yes, measured | — | — | — |
-| One-shot script | `headless` | yes, measured | yes, measured | — | — | — |
-| SDK embedding | `sdk` | config composes, not run | same | — | — | — |
-| Minimal SDK | `sdk-minimal` | n/a (no `tools`) | n/a | — | — | — |
+| Carrier | Profile | `/connectors` command | `conn_list` / `conn_request` | `connectors` service | `/api/connectors/*` | `/dsh-connectors` page | Settings section |
+| --- | --- | --- | --- | --- | --- | --- | --- |
+| Browser | `web` | yes | yes, measured | yes, measured | yes, measured | yes, measured | yes |
+| DSHA (full DSH on an Android phone) | `web` (`dsh-web-mobile`) | yes | yes | yes | yes | yes (WebView) | yes (fixed in 0.3.1) |
+| Desktop client (Electron) | separate | yes | expected | expected | expected (carrier-neutral) | absent (no `webServer`) | yes (same client bundle) |
+| Other WebView shells (Tauri, etc.) | `web` | yes | expected | expected | depends on `webServer` | same | yes (deps completed) |
+| DSH Go (Android / iOS) | in-app engine | yes | expected | expected | through the app's `/dsh-go/v1` bridge | not rendered (native UI) | not rendered (native panel instead) |
+| Editor ACP client | `acp` | yes | yes, measured | yes, measured | — | — | — |
+| One-shot script | `headless` | yes | yes, measured | yes, measured | — | — | — |
+| SDK embedding | `sdk` | depends on command palette | config composes, not run | same | — | — | — |
+| Minimal SDK | `sdk-minimal` | n/a | n/a (no `tools`) | n/a | — | — | — |
 
 **DSH Go's UI is not a web page.** The app does not render `/dsh-connectors` and does not run plugin frontend code; it reads the `dshGo` manifest in `package.json`, and the host half feeds the slot through `ctx.dshGo`, so the app draws it with its own widgets. Since 0.3.0 the plugin declares one native "Connectors" panel and one status strip — see [DSH Go native panel](#dsh-go-native-panel). The rest of that row says "expected" because this round had no Android device; the protocol layer was checked with dsh-go's own `plugin-kit` checker and test host (`test/dshgo.test.mjs`).
 
@@ -52,12 +54,27 @@ The desktop row says "expected", not "measured": this repository has no desktop 
 
 `—` means the carrier has no `connection` or `webServer` service at all, not that the plugin is missing. `inject` hard-depends on `tools` only (the agent core service, always present via `dsh-base`); `connection` and `webServer` are mounted on demand, so a shell without an HTTP layer keeps the tools and the service and simply has no page.
 
+### Universal entry point: the `/connectors` command
+
+**This is the "installed, therefore visible" fallback.** The settings section needs `@deepseek-ai/dsh-client-ui-slots`, the standalone page needs `webServer`, and the mobile panel needs `dsh-go-bridge` — any of these may be absent in the client you happen to use. But the `commands` service is mounted by `dsh-base`, so every client that can chat has it. Just type into the composer:
+
+```
+/connectors              # what is connected now, and as whom
+/connectors help         # the full guide to all connect methods
+/connectors github       # how to connect one platform, with a copy-paste command
+```
+
+The command is read-only: it reports state and tells you where to connect. It never writes a token into the conversation. The actual connect still happens in the settings page or the terminal. So even on a client that renders no web panel at all, there is always one visible, actionable entry point.
+
+> 0.3.1 fixed a real "installed and activated but nothing showed up" defect: the client bundle's `dsh.client.inject` declared only `dsh-client-ui-settings-general`, while the settings section actually needs `dsh-client-ui-slots` and `dsh-client-locale`. With the wrong declaration the slots service was never loaded first and the section silently failed to register — the plugin looked enabled but offered no UI. It now declares the same service set as DSHA's own visible plugins (see `test/client-manifest.test.mjs`).
+
 ## Connect
 
-1. **Settings → Connectors** for the desktop UI.
-2. **`http://<harness>/dsh-connectors`** for a narrow-screen page that works from a phone browser or a tunnel. It shares the app's session: an unauthenticated request gets **401**, so open the harness first.
-3. **DSH Go's native panel**, once the dsh-go bridge is installed: All features, the plugin detail page and a chat's Plugins tab show "Connectors" with the platforms that are already authorised. Authorising still happens in the settings page or the terminal.
-4. **Terminal**, when there is no comfortable browser:
+1. **Settings → Connectors** for the desktop, DSHA and WebView clients.
+2. **The `/connectors` command** — type `/connectors help` in any client that can chat and follow the guide. The guaranteed fallback.
+3. **`http://<harness>/dsh-connectors`** for a narrow-screen page that works from a phone browser or a tunnel. It shares the app's session: an unauthenticated request gets **401**, so open the harness first.
+4. **DSH Go's native panel**, once the dsh-go bridge is installed: All features, the plugin detail page and a chat's Plugins tab show "Connectors" with the platforms that are already authorised. Authorising still happens in the settings page or the terminal.
+5. **Terminal**, when there is no comfortable browser:
 
 ```bash
 npx -y dsh-connectors add github          # hidden input

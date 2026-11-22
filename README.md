@@ -51,15 +51,17 @@ dsh plugin --profile web add dsh-connectors
 
 官方的 npm 发行版只有五种 profile 模板（`acp` / `web` / `headless` / `sdk` / `sdk-minimal`），**桌面客户端不在这五种里**：它是独立分发的 Electron 应用，自带 stable/nightly 更新通道，用 `file://` 加 IPC 提供前端而不启动 `webServer`（`@deepseek-ai/dsh-host-webserver` 的类型注释原文："Electron uses file:// plus IPC"）。插件按服务存在与否分面挂载，每种载体拿到的功能如下：
 
-| 载体 | profile | 工具 `conn_list` / `conn_request` | `connectors` 服务 | `/api/connectors/*` | `/dsh-connectors` 页面 | 设置页 |
-| --- | --- | --- | --- | --- | --- | --- |
-| 浏览器 | `web` | ✅ 实测 | ✅ 实测 | ✅ 实测 | ✅ 实测 | ✅ |
-| 桌面客户端（Electron） | 独立分发 | 预期可用 | 预期可用 | 预期可用（carrier-neutral） | 不存在（无 `webServer`） | ✅（同一套客户端 bundle） |
-| DSH Go（Android / iOS） | App 内置引擎 | 预期可用 | 预期可用 | 走 App 的 `/dsh-go/v1` 桥接 | 不渲染（原生界面） | 不渲染（改用原生面板） |
-| 编辑器 ACP 客户端 | `acp` | ✅ 实测 | ✅ 实测 | — | — | — |
-| 一次性脚本 | `headless` | ✅ 实测 | ✅ 实测 | — | — | — |
-| SDK 嵌入 | `sdk` | 配置可合成，运行未实测 | 同左 | — | — | — |
-| 极简 SDK | `sdk-minimal` | 不适用（无 `tools`） | 不适用 | — | — | — |
+| 载体 | profile | 通用入口 `/connectors` 命令 | 工具 `conn_list` / `conn_request` | `connectors` 服务 | `/api/connectors/*` | `/dsh-connectors` 页面 | 设置页 |
+| --- | --- | --- | --- | --- | --- | --- | --- |
+| 浏览器 | `web` | ✅ | ✅ 实测 | ✅ 实测 | ✅ 实测 | ✅ 实测 | ✅ |
+| DSHA（Android 手机跑完整 DSH） | `web`（`dsh-web-mobile`） | ✅ | ✅ | ✅ | ✅ | ✅（WebView） | ✅（0.3.1 修复依赖后） |
+| 桌面客户端（Electron） | 独立分发 | ✅ | 预期可用 | 预期可用 | 预期可用（carrier-neutral） | 不存在（无 `webServer`） | ✅（同一套客户端 bundle） |
+| 其他第三方 WebView 壳（Tauri 等） | `web` | ✅ | 预期可用 | 预期可用 | 看是否启动 `webServer` | 同左 | ✅（依赖已补全） |
+| DSH Go（Android / iOS） | App 内置引擎 | ✅ | 预期可用 | 预期可用 | 走 App 的 `/dsh-go/v1` 桥接 | 不渲染（原生界面） | 不渲染（改用原生面板） |
+| 编辑器 ACP 客户端 | `acp` | ✅ | ✅ 实测 | ✅ 实测 | — | — | — |
+| 一次性脚本 | `headless` | ✅ | ✅ 实测 | ✅ 实测 | — | — | — |
+| SDK 嵌入 | `sdk` | 视命令面板 | 配置可合成，运行未实测 | 同左 | — | — | — |
+| 极简 SDK | `sdk-minimal` | 不适用 | 不适用（无 `tools`） | 不适用 | — | — | — |
 
 **DSH Go 的界面不是网页。** App 不渲染 `/dsh-connectors`，也不运行插件前端；它读 `package.json` 里的 `dshGo` 清单，宿主半侧通过 `ctx.dshGo` 提供视图与数据，App 用自己的组件画。0.3.0 起插件声明一个「连接器」原生面板和一条状态条，见[DSH Go 原生面板](#dsh-go-原生面板)。DSH Go 一行的其余各列标"预期"，因为这一轮没有 Android 设备可跑真机；协议层用 dsh-go 自带的 `plugin-kit` 检查器和测试宿主验证过（见 `test/dshgo.test.mjs`）。
 
@@ -67,14 +69,29 @@ dsh plugin --profile web add dsh-connectors
 
 "`—`"表示该载体本身没有 `connection` 或 `webServer` 服务，不是插件缺失。插件的 `inject` 只硬依赖 `tools`（DSH 的 agent 核心服务，`dsh-base` 必带）；`connection` 和 `webServer` 都是按需挂载，所以在没有 HTTP 层的 shell 里，工具和服务照常可用，页面与接口则不存在。
 
+### 通用入口：`/connectors` 命令
+
+**这是"装了就能看到"的保底入口。** 设置页依赖 `@deepseek-ai/dsh-client-ui-slots`、独立页依赖 `webServer`、手机面板依赖 `dsh-go-bridge`——每一样都可能在你用的那个客户端里缺席。但 `commands` 服务由 `dsh-base` 挂载，凡是能聊天的 DSH 客户端都有它。所以在输入框里敲：
+
+```
+/connectors              # 现在连了哪些平台、账号是什么
+/connectors help         # 三种连接方式的完整指引
+/connectors github       # 某一个平台怎么连（含直达命令）
+```
+
+命令只读取状态、告诉你"去哪连、怎么连"，**不会把令牌写进对话记录**。真正的连接动作仍在设置页或终端完成。这样哪怕你用的客户端一个网页面板都不渲染，也总能有一条可见、可操作的入口。
+
+> 0.3.1 修了一个导致"装了、激活了却什么都没有"的真实缺陷：客户端 bundle 的 `dsh.client.inject` 原先只声明了 `dsh-client-ui-settings-general`，而设置页实际需要的是 `dsh-client-ui-slots` 和 `dsh-client-locale`。依赖声明错了，slots 服务没被提前加载，设置分区静默注册失败——插件看着已启用，界面上却没有入口。现已按 DSHA 官方内置插件的同款依赖集合补全（见 `test/client-manifest.test.mjs`）。
+
 ## 连接一个平台
 
-三种入口，按你手边有什么选：
+几种入口，按你手边有什么选：
 
-1. **设置页**：`设置 → 连接器`，点"连接"，粘贴令牌。适合电脑端。
-2. **独立页面**：浏览器打开 `http://<你的 DSH 地址>/dsh-connectors`。布局按窄屏做的，适合手机浏览器和隧道访问；它和主界面共用同一个登录态，**未登录会返回 401**，需要先打开 DSH 主界面完成登录。
-3. **终端**：手机或服务器上没有顺手的浏览器时用这个。
-4. **DSH Go 原生面板**：装好 dsh-go bridge 后，App 的「全部功能」、插件详情、对话详情 ›「插件」里会出现「连接器」，只列已授权的平台。授权动作仍在设置页或终端完成。
+1. **设置页**：`设置 → 连接器`，点"连接"，粘贴令牌。适合电脑端、DSHA 及各 WebView 客户端。
+2. **`/connectors` 命令**：任何能聊天的客户端里敲 `/connectors help`，跟着指引走。保底入口。
+3. **独立页面**：浏览器打开 `http://<你的 DSH 地址>/dsh-connectors`。布局按窄屏做的，适合手机浏览器和隧道访问；它和主界面共用同一个登录态，**未登录会返回 401**，需要先打开 DSH 主界面完成登录。
+4. **终端**：手机或服务器上没有顺手的浏览器时用这个，`npx -y dsh-connectors add github`。
+5. **DSH Go 原生面板**：装好 dsh-go bridge 后，App 的「全部功能」、插件详情、对话详情 ›「插件」里会出现「连接器」，只列已授权的平台。授权动作仍在设置页或终端完成。
 
 ```bash
 # 交互式，输入不回显
