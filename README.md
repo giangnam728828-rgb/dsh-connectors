@@ -48,15 +48,18 @@ dsh plugin --profile web add dsh-connectors
 
 ### 载体兼容矩阵
 
-DSH 官方发行版只有五种 profile 模板，**没有 `desktop` 这一档**——所谓"桌面端"就是 `web` profile 跑在浏览器里。插件按服务存在与否分面挂载，每种载体拿到的功能如下（全部在本仓库 0.2.1 上实测）：
+官方的 npm 发行版只有五种 profile 模板（`acp` / `web` / `headless` / `sdk` / `sdk-minimal`），**桌面客户端不在这五种里**：它是独立分发的 Electron 应用，自带 stable/nightly 更新通道，用 `file://` 加 IPC 提供前端而不启动 `webServer`（`@deepseek-ai/dsh-host-webserver` 的类型注释原文："Electron uses file:// plus IPC"）。插件按服务存在与否分面挂载，每种载体拿到的功能如下：
 
 | 载体 | profile | 工具 `conn_list` / `conn_request` | `connectors` 服务 | `/api/connectors/*` | `/dsh-connectors` 页面 | 设置页 |
 | --- | --- | --- | --- | --- | --- | --- |
-| 浏览器 / 桌面浏览器 | `web` | ✅ | ✅ | ✅ | ✅ | ✅ |
-| 编辑器 ACP 客户端 | `acp` | ✅ | ✅ | — | — | — |
-| 一次性脚本 | `headless` | ✅ | ✅ | — | — | — |
-| SDK 嵌入 | `sdk` | 未测 | 未测 | — | — | — |
+| 浏览器 | `web` | ✅ 实测 | ✅ 实测 | ✅ 实测 | ✅ 实测 | ✅ |
+| 桌面客户端（Electron） | 独立分发 | 预期可用 | 预期可用 | 预期可用（carrier-neutral） | 不存在（无 `webServer`） | ✅（同一套客户端 bundle） |
+| 编辑器 ACP 客户端 | `acp` | ✅ 实测 | ✅ 实测 | — | — | — |
+| 一次性脚本 | `headless` | ✅ 实测 | ✅ 实测 | — | — | — |
+| SDK 嵌入 | `sdk` | 配置可合成，运行未实测 | 同左 | — | — | — |
 | 极简 SDK | `sdk-minimal` | 不适用（无 `tools`） | 不适用 | — | — | — |
+
+桌面客户端一栏标"预期"而不是"实测"：本仓库没有它的二进制，无法在 CI 里跑。代码层面已经去掉了对 `webServer` 的硬依赖，`/api` 路由走的是 carrier-neutral 的 fetch registry，所以 IPC 载具理论上同样能分发；这一点需要装一次桌面客户端用 `dsh plugin --profile <名> list` 确认 profile 名后才能定论。**桌面端没有独立页面**，管理入口是设置页。
 
 "`—`"表示该载体本身没有 `connection` 或 `webServer` 服务，不是插件缺失。插件的 `inject` 只硬依赖 `tools`（DSH 的 agent 核心服务，`dsh-base` 必带）；`connection` 和 `webServer` 都是按需挂载，所以在没有 HTTP 层的 shell 里，工具和服务照常可用，页面与接口则不存在。
 

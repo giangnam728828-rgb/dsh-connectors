@@ -33,15 +33,18 @@ Compatibility: DSH 0.2.1-rc.3 – 0.2.x, Node `^22.19 || >=24`. Verified against
 
 ### Carrier matrix
 
-The official distribution ships five profile templates and **no `desktop` tier** — the so-called desktop app is the `web` profile in a browser. The plugin attaches each surface only where its service exists. All rows below were measured on 0.2.1:
+The npm distribution ships five profile templates (`acp` / `web` / `headless` / `sdk` / `sdk-minimal`). **The desktop client is not one of them**: it is a separately distributed Electron app with its own stable/nightly channel, and it serves the frontend over `file://` plus IPC without starting `webServer` — the type comment in `@deepseek-ai/dsh-host-webserver` says exactly that: *"Electron uses file:// plus IPC"*. The plugin attaches each surface only where its service exists.
 
 | Carrier | Profile | `conn_list` / `conn_request` | `connectors` service | `/api/connectors/*` | `/dsh-connectors` page | Settings section |
 | --- | --- | --- | --- | --- | --- | --- |
-| Browser / desktop browser | `web` | yes | yes | yes | yes | yes |
-| Editor ACP client | `acp` | yes | yes | — | — | — |
-| One-shot script | `headless` | yes | yes | — | — | — |
-| SDK embedding | `sdk` | config only, not run | config only | — | — | — |
+| Browser | `web` | yes, measured | yes, measured | yes, measured | yes, measured | yes |
+| Desktop client (Electron) | separate | expected | expected | expected (carrier-neutral) | absent (no `webServer`) | yes (same client bundle) |
+| Editor ACP client | `acp` | yes, measured | yes, measured | — | — | — |
+| One-shot script | `headless` | yes, measured | yes, measured | — | — | — |
+| SDK embedding | `sdk` | config composes, not run | same | — | — | — |
 | Minimal SDK | `sdk-minimal` | n/a (no `tools`) | n/a | — | — | — |
+
+The desktop row says "expected", not "measured": this repository has no desktop binary to run in CI. The code no longer hard-depends on `webServer`, and `/api` routes go through the carrier-neutral fetch registry, so an IPC carrier should dispatch them too; confirming that needs one install of the desktop client and a `dsh plugin --profile <name> list` to learn its profile name. **The desktop client has no standalone page** — its entry point is the settings section.
 
 `—` means the carrier has no `connection` or `webServer` service at all, not that the plugin is missing. `inject` hard-depends on `tools` only (the agent core service, always present via `dsh-base`); `connection` and `webServer` are mounted on demand, so a shell without an HTTP layer keeps the tools and the service and simply has no page.
 
