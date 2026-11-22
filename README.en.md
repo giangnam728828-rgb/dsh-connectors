@@ -31,6 +31,20 @@ Then restart `dsh web` and open **Settings → Connectors**.
 
 Compatibility: DSH 0.2.1-rc.3 – 0.2.x, Node `^22.19 || >=24`. Verified against DSH 0.2.2-rc.5.
 
+### Carrier matrix
+
+The official distribution ships five profile templates and **no `desktop` tier** — the so-called desktop app is the `web` profile in a browser. The plugin attaches each surface only where its service exists. All rows below were measured on 0.2.1:
+
+| Carrier | Profile | `conn_list` / `conn_request` | `connectors` service | `/api/connectors/*` | `/dsh-connectors` page | Settings section |
+| --- | --- | --- | --- | --- | --- | --- |
+| Browser / desktop browser | `web` | yes | yes | yes | yes | yes |
+| Editor ACP client | `acp` | yes | yes | — | — | — |
+| One-shot script | `headless` | yes | yes | — | — | — |
+| SDK embedding | `sdk` | config only, not run | config only | — | — | — |
+| Minimal SDK | `sdk-minimal` | n/a (no `tools`) | n/a | — | — | — |
+
+`—` means the carrier has no `connection` or `webServer` service at all, not that the plugin is missing. `inject` hard-depends on `tools` only (the agent core service, always present via `dsh-base`); `connection` and `webServer` are mounted on demand, so a shell without an HTTP layer keeps the tools and the service and simply has no page.
+
 ## Connect
 
 1. **Settings → Connectors** for the desktop UI.

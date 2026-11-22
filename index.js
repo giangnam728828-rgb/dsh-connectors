@@ -41,7 +41,7 @@ export const name = 'dsh-connectors';
  * no service, no settings page. Each surface is attached where its own service
  * exists instead.
  */
-export const inject = [];
+export const inject = ['tools'];
 
 const MAX_BODY_BYTES = 8 * 1024;
 
@@ -451,8 +451,16 @@ async function assertRawCredentials(home) {
 export function apply(ctx) {
   const home = connectorHome();
 
+  // `tools` is a declared dependency of the module, so the loader has already
+  // mounted it by the time this runs. A bare `ctx.get` used to be enough in the
+  // web shell only because `tools` happened to load first there; in the
+  // headless and ACP shells it arrived later and the model never saw
+  // `conn_list`. Resolve the service here, in the plugin body: inside
+  // `ctx.effect` the context is a fresh scope where the property is not
+  // declared, and a failed effect is swallowed, which is exactly how the tools
+  // went missing without a single log line.
+  const tools = ctx.get('tools');
   ctx.effect(() => {
-    const tools = ctx.get('tools');
     if (tools === undefined) return () => {};
     const disposers = [tools.register(LIST_TOOL), tools.register(REQUEST_TOOL)];
     return () => {

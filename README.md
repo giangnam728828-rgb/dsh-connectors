@@ -44,7 +44,21 @@ dsh plugin --profile web add dsh-connectors
 
 安装后重启 `dsh web`，打开 **设置 → 连接器**。
 
-> 兼容基线：DSH 0.2.1-rc.3 到 0.2.x，Node `^22.19 || >=24`（DSH 自身用到了 `import.meta.main`，更老的 Node 会在启动阶段静默退出）。已在 DSH 0.2.2-rc.5 上验证：插件可加载、配置行可合成、页面与接口可用。
+> 兼容基线：DSH 0.2.1-rc.3 到 0.2.x，Node `^22.19 || >=24`（DSH 自身用到了 `import.meta.main` 和 `zlib` 的 zstd 导出，更老的 Node 会在启动阶段静默退出）。逐项实测见下表。
+
+### 载体兼容矩阵
+
+DSH 官方发行版只有五种 profile 模板，**没有 `desktop` 这一档**——所谓"桌面端"就是 `web` profile 跑在浏览器里。插件按服务存在与否分面挂载，每种载体拿到的功能如下（全部在本仓库 0.2.1 上实测）：
+
+| 载体 | profile | 工具 `conn_list` / `conn_request` | `connectors` 服务 | `/api/connectors/*` | `/dsh-connectors` 页面 | 设置页 |
+| --- | --- | --- | --- | --- | --- | --- |
+| 浏览器 / 桌面浏览器 | `web` | ✅ | ✅ | ✅ | ✅ | ✅ |
+| 编辑器 ACP 客户端 | `acp` | ✅ | ✅ | — | — | — |
+| 一次性脚本 | `headless` | ✅ | ✅ | — | — | — |
+| SDK 嵌入 | `sdk` | 未测 | 未测 | — | — | — |
+| 极简 SDK | `sdk-minimal` | 不适用（无 `tools`） | 不适用 | — | — | — |
+
+"`—`"表示该载体本身没有 `connection` 或 `webServer` 服务，不是插件缺失。插件的 `inject` 只硬依赖 `tools`（DSH 的 agent 核心服务，`dsh-base` 必带）；`connection` 和 `webServer` 都是按需挂载，所以在没有 HTTP 层的 shell 里，工具和服务照常可用，页面与接口则不存在。
 
 ## 连接一个平台
 
